@@ -1,6 +1,7 @@
 pub use kannolo::graph;
 pub use kannolo::indexes::hnsw;
 
+pub mod pgc;
 pub mod tac;
 pub mod tachiom;
 

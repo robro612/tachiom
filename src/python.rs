@@ -4,6 +4,7 @@
 //! single `tachiom` module with one `Tachiom` class.
 
 use crate::hnsw::HNSWBuildConfiguration;
+use crate::pgc::{EmptyAnchorStrategy, PgcBuilder};
 use crate::tac::{TacBuilder, TacResult};
 use crate::tachiom::{Tachiom, TachiomBuildParams, TachiomInputDataset};
 use vectorium::core::index::Index;
@@ -368,6 +369,121 @@ impl PyTachiom {
         };
 
         let inner = py.allow_threads(|| Tachiom::<M_FIXED>::build_index(dataset, &params));
+        Ok(PyTachiom { inner })
+    }
+
+    /// Build a Tachiom index using Proximity Graph Clustering (PGC) instead of TAC.
+    ///
+    /// PGC is token-type-agnostic: it works directly on raw embeddings without
+    /// needing vocabulary IDs.  All standard Tachiom params (PQ, HNSW) are forwarded
+    /// unchanged; only the coarse-centroid step is replaced.
+    #[classmethod]
+    #[pyo3(signature = (
+        vectors,
+        token_ids,
+        doclens,
+        *,
+        total_centroids = 4_194_304,
+        pgc_n_iter = 10,
+        pgc_sample_multiplier = 5,
+        pgc_empty_strategy = "resample",
+        pgc_iter_hnsw_m = 16,
+        pgc_iter_ef_construction = 200,
+        pgc_iter_ef_search = 50,
+        pgc_seed = 42,
+        pq_sample_size = 10_000_000,
+        pq_n_iter = 10,
+        normalize = false,
+        pq_seed = 42,
+        hnsw_m = 32,
+        ef_construction = 1500,
+        pq_subspaces = 32,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn build_with_pgc(
+        _cls: &Bound<'_, PyType>,
+        py: Python<'_>,
+        vectors: PyReadonlyArray2<'_, u16>,
+        token_ids: PyReadonlyArray1<'_, u32>,
+        doclens: PyReadonlyArray1<'_, i32>,
+        total_centroids: usize,
+        pgc_n_iter: usize,
+        pgc_sample_multiplier: usize,
+        pgc_empty_strategy: &str,
+        pgc_iter_hnsw_m: usize,
+        pgc_iter_ef_construction: usize,
+        pgc_iter_ef_search: usize,
+        pgc_seed: u64,
+        pq_sample_size: usize,
+        pq_n_iter: usize,
+        normalize: bool,
+        pq_seed: u64,
+        hnsw_m: usize,
+        ef_construction: usize,
+        pq_subspaces: usize,
+    ) -> PyResult<Self> {
+        warn_pq_subspaces(py, pq_subspaces)?;
+
+        let empty_strategy = match pgc_empty_strategy {
+            "resample" => EmptyAnchorStrategy::Resample,
+            "remove" => EmptyAnchorStrategy::Remove,
+            other => {
+                return Err(PyValueError::new_err(format!(
+                    "pgc_empty_strategy must be \"resample\" or \"remove\", got {:?}",
+                    other
+                )))
+            }
+        };
+
+        let (dataset, token_ids_vec) = dataset_from_arrays(&vectors, &token_ids, &doclens)?;
+
+        let pgc = PgcBuilder::new()
+            .n_iter(pgc_n_iter)
+            .sample_multiplier(pgc_sample_multiplier)
+            .empty_strategy(empty_strategy)
+            .iter_hnsw_m(pgc_iter_hnsw_m)
+            .iter_ef_construction(pgc_iter_ef_construction)
+            .iter_ef_search(pgc_iter_ef_search)
+            .seed(pgc_seed)
+            .verbose(true)
+            .build();
+
+        let params = TachiomBuildParams {
+            token_ids: token_ids_vec,
+            total_centroids,
+            tac_n_iter: 0,
+            pq_sample_size,
+            pq_n_iter,
+            normalize,
+            pq_seed: Some(pq_seed),
+            hnsw_params: HNSWBuildConfiguration::default()
+                .with_num_neighbors(hnsw_m)
+                .with_ef_construction(ef_construction),
+        };
+
+        // Run PGC outside the GIL, then hand centroids+assignments to build_index_from_tac.
+        //
+        // We need a cloned copy of the flat data for PGC because PGC borrows it
+        // throughout the iteration loop while `dataset` must stay alive for the
+        // subsequent build step (which takes ownership of `dataset`).
+        // The clone is freed immediately after PGC returns.
+        let inner = py.allow_threads(|| {
+            let dim = dataset.encoder().input_dim();
+            let n_tokens = dataset.values().len() / dim;
+            let n_req = total_centroids.min(n_tokens);
+
+            let flat_f16: Vec<f16> = dataset.values().to_vec();
+            let pgc_result = pgc.cluster(&flat_f16, dim, n_req);
+            drop(flat_f16);
+
+            Tachiom::<M_FIXED>::build_index_from_tac(
+                pgc_result.centroids,
+                pgc_result.n_centroids,
+                pgc_result.assignments,
+                dataset,
+                &params,
+            )
+        });
         Ok(PyTachiom { inner })
     }
 
