@@ -5,6 +5,7 @@ use std::io::{BufReader, Read};
 use std::time::Instant;
 
 use tachiom::hnsw::HNSWBuildConfiguration;
+use tachiom::tac::TacAllocParams;
 use tachiom::tachiom::{Tachiom, TachiomBuildParams, TachiomInputDataset};
 use vectorium::core::index::Index;
 use vectorium::{IndexSerializer, MultiVectorDataset, PlainMultiVecQuantizer};
@@ -155,8 +156,7 @@ fn main() -> anyhow::Result<()> {
         token_ids,
         total_centroids: n_centroids, // unused by build_index_from_tac, but required by the struct
         tac_n_iter: 0,                // unused (TAC already run externally)
-        tac_micro_threshold: None,
-        tac_small_threshold: None,
+        tac_alloc_params: TacAllocParams::default(),
         pq_sample_size: args.pq_sample_size,
         pq_n_iter: args.pq_n_iter,
         normalize: args.normalize,

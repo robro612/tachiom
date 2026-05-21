@@ -104,6 +104,33 @@ unsafe fn compute_squared_diff_avx2(vector: &[f16], means: &[f32]) -> f64 {
 // Damped Spread Strategy
 // ============================================================================
 
+/// Allocation hyper-parameters for [`allocate_centroids_damped_spread`].
+///
+/// Correspond to the paper's μ, τ, ε, θ respectively.
+#[derive(Debug, Clone, Copy)]
+pub struct TacAllocParams {
+    /// μ — tokens with fewer than this many vectors get 1 centroid (micro tier).
+    pub micro_threshold: usize,
+    /// τ — tokens in [μ, τ) get 2 centroids (small tier).
+    pub small_threshold: usize,
+    /// ε — hard floor on centroids for active (≥ τ) tokens.
+    pub hard_floor: usize,
+    /// θ — cap formula: `max_centroids_for_token = n / θ`.
+    /// Also used in the training-sample formula: `max(1M, 2θk, n/(2·n_iter))`.
+    pub min_pts_per_centroid: usize,
+}
+
+impl Default for TacAllocParams {
+    fn default() -> Self {
+        TacAllocParams {
+            micro_threshold: 128,
+            small_threshold: 256,
+            hard_floor: 4,
+            min_pts_per_centroid: 39,
+        }
+    }
+}
+
 /// Allocate a centroid budget across token groups using the damped-spread strategy.
 ///
 /// The strategy favors medium-frequency terms with high variance, penalises
@@ -116,12 +143,13 @@ pub fn allocate_centroids_damped_spread(
     data: &[f16],
     dim: usize,
     total_centroids: usize,
-    micro_threshold: usize,
-    small_threshold: usize,
     verbose: bool,
+    params: &TacAllocParams,
 ) -> HashMap<usize, usize> {
-    const HARD_FLOOR: usize = 4;
-    const MIN_POINTS_PER_CENTROID: usize = 39;
+    let micro_threshold = params.micro_threshold;
+    let small_threshold = params.small_threshold;
+    let hard_floor = params.hard_floor;
+    let min_pts_per_centroid = params.min_pts_per_centroid;
 
     let n_vectors: usize = token_groups.values().map(|v| v.len()).sum();
 
@@ -134,7 +162,7 @@ pub fn allocate_centroids_damped_spread(
     );
     println!(
         "Bounds: Floor = {}, Min points/centroid = {}",
-        HARD_FLOOR, MIN_POINTS_PER_CENTROID
+        hard_floor, min_pts_per_centroid
     );
 
     // ── Phase 1: Tail handling ────────────────────────────────────────────────
@@ -257,9 +285,9 @@ pub fn allocate_centroids_damped_spread(
 
     for (token_id, prov) in &provisional {
         let count = token_groups[token_id].len();
-        let cap = (count / MIN_POINTS_PER_CENTROID).max(HARD_FLOOR);
-        let floored = prov.max(HARD_FLOOR as f64);
-        let rounded = (floored.round() as usize).max(HARD_FLOOR);
+        let cap = (count / min_pts_per_centroid).max(hard_floor);
+        let floored = prov.max(hard_floor as f64);
+        let rounded = (floored.round() as usize).max(hard_floor);
         let final_alloc = rounded.min(cap);
         let is_capped = final_alloc == cap && rounded > cap;
         let frac = floored - floored.floor();
@@ -268,10 +296,10 @@ pub fn allocate_centroids_damped_spread(
 
     println!(
         "Tokens hitting floor ({}): {}",
-        HARD_FLOOR,
+        hard_floor,
         bounded
             .iter()
-            .filter(|&&(_, a, _, _)| a == HARD_FLOOR)
+            .filter(|&&(_, a, _, _)| a == hard_floor)
             .count()
     );
     println!(
@@ -325,7 +353,7 @@ pub fn allocate_centroids_damped_spread(
                 if distributed >= surplus {
                     break;
                 }
-                let cap = (token_groups[token_id].len() / MIN_POINTS_PER_CENTROID).max(HARD_FLOOR);
+                let cap = (token_groups[token_id].len() / min_pts_per_centroid).max(hard_floor);
                 if *alloc < cap {
                     *alloc += 1;
                     distributed += 1;
@@ -376,7 +404,7 @@ pub fn allocate_centroids_damped_spread(
                 if removed >= deficit {
                     break;
                 }
-                if *alloc > HARD_FLOOR {
+                if *alloc > hard_floor {
                     *alloc -= 1;
                     removed += 1;
                     made_progress = true;

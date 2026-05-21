@@ -12,7 +12,7 @@ use crate::graph::Graph;
 use crate::hnsw::{
     EarlyTerminationStrategy, HNSW, HNSWBuildConfiguration, HNSWSearchConfiguration,
 };
-use crate::tac::TacBuilder;
+use crate::tac::{TacAllocParams, TacBuilder};
 
 use vectorium::core::dataset::ScoredVector;
 use vectorium::core::index::Index;
@@ -802,11 +802,8 @@ pub struct TachiomBuildParams {
     /// K-means iterations per token type inside TAC (default: 10).
     pub tac_n_iter: usize,
 
-    /// Token groups smaller than this receive 1 centroid each (`None` = use TAC default of 128).
-    pub tac_micro_threshold: Option<usize>,
-
-    /// Token groups in [micro, small) receive 2 centroids each (`None` = use TAC default of 256).
-    pub tac_small_threshold: Option<usize>,
+    /// TAC allocation hyper-parameters (μ, τ, ε, θ).
+    pub tac_alloc_params: TacAllocParams,
 
     /// Number of tokens sampled for PQ training.
     pub pq_sample_size: usize,
@@ -835,8 +832,7 @@ impl Default for TachiomBuildParams {
             token_ids: Vec::new(),
             total_centroids: 4_194_304,
             tac_n_iter: 10,
-            tac_micro_threshold: None,
-            tac_small_threshold: None,
+            tac_alloc_params: TacAllocParams::default(),
             pq_sample_size: 10_000_000,
             pq_n_iter: 10,
             normalize: false,
@@ -993,14 +989,11 @@ impl<const M: usize> Index<TachiomInputDataset> for Tachiom<M> {
             n_tokens
         );
         println!("[Tachiom::build_index] Step 1: Token-Aware Clustering...");
-        let mut tac_builder = TacBuilder::new().n_iter(params.tac_n_iter);
-        if let Some(v) = params.tac_micro_threshold {
-            tac_builder = tac_builder.micro_threshold(v);
-        }
-        if let Some(v) = params.tac_small_threshold {
-            tac_builder = tac_builder.small_threshold(v);
-        }
-        let tac = tac_builder.build();
+        let tac = TacBuilder::new()
+            .n_iter(params.tac_n_iter)
+            .alloc_params(params.tac_alloc_params)
+            .verbose(true)
+            .build();
         let tac_result = tac.train(
             flat_f16_ref,
             token_dim,

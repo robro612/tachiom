@@ -33,6 +33,10 @@ pub enum EmptyAnchorStrategy {
     Resample,
     /// Drop the empty anchor, permanently reducing the active centroid count.
     Remove,
+    /// Reinitialise the empty anchor from a random member of the most-populated
+    /// cluster.  Keeps the anchor count fixed (like Resample) while seeding the
+    /// new position from a region that is demonstrably dense in the data.
+    Split,
 }
 
 /// Result returned by [`ProximityGraphClustering::cluster`].
@@ -293,6 +297,47 @@ impl ProximityGraphClustering {
                     }
                     n_active = new_anchors.len() / dim;
                     anchors = new_anchors;
+                }
+                EmptyAnchorStrategy::Split => {
+                    // Find the most-populated anchor.
+                    let max_anchor = counts
+                        .iter()
+                        .enumerate()
+                        .max_by_key(|&(_, &c)| c)
+                        .map(|(i, _)| i)
+                        .unwrap_or(0);
+
+                    // Collect the sampled vector indices assigned to that anchor.
+                    let max_members: Vec<usize> = sampled
+                        .iter()
+                        .zip(iter_assignments.iter())
+                        .filter_map(|(&vidx, &aidx)| {
+                            if aidx.min(n_active - 1) == max_anchor { Some(vidx) } else { None }
+                        })
+                        .collect();
+
+                    for a in 0..n_active {
+                        if counts[a] > 0 {
+                            let mut mean: Vec<f32> = sums[a * dim..(a + 1) * dim]
+                                .iter()
+                                .map(|&x| x / counts[a] as f32)
+                                .collect();
+                            l2_normalize_f32(&mut mean);
+                            for (j, &v) in mean.iter().enumerate() {
+                                anchors[a * dim + j] = f16::from_f32(v);
+                            }
+                        } else {
+                            // Seed from a random member of the busiest cluster.
+                            let ridx = if !max_members.is_empty() {
+                                max_members[rng.gen_range(0..max_members.len())]
+                            } else {
+                                rng.gen_range(0..n_vectors) // degenerate fallback
+                            };
+                            anchors[a * dim..(a + 1) * dim]
+                                .copy_from_slice(&data[ridx * dim..(ridx + 1) * dim]);
+                        }
+                    }
+                    // n_active stays unchanged.
                 }
             }
 

@@ -25,6 +25,7 @@ use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
 use rayon::prelude::*;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use vectorium::{
@@ -32,15 +33,9 @@ use vectorium::{
     SquaredEuclideanDistance,
 };
 
+pub use strategies::TacAllocParams;
 pub use strategies::allocate_centroids_damped_spread;
 pub use strategies::compute_spread_measure;
-
-// ============================================================================
-// Default thresholds for token group classification
-// ============================================================================
-
-const DEFAULT_MICRO_THRESHOLD: usize = 128;
-const DEFAULT_SMALL_THRESHOLD: usize = 256;
 
 // ============================================================================
 // Output
@@ -78,8 +73,7 @@ pub struct TacBuilder {
     /// `Some(usize::MAX)` = never sample, always use the full group.
     /// `Some(n)` = use at most `n` vectors for training.
     max_sample_size: Option<usize>,
-    micro_threshold: Option<usize>,
-    small_threshold: Option<usize>,
+    alloc_params: TacAllocParams,
 }
 
 impl Default for TacBuilder {
@@ -88,8 +82,7 @@ impl Default for TacBuilder {
             n_iter: 10,
             verbose: false,
             max_sample_size: None,
-            micro_threshold: None,
-            small_threshold: None,
+            alloc_params: TacAllocParams::default(),
         }
     }
 }
@@ -123,17 +116,8 @@ impl TacBuilder {
         self
     }
 
-    /// Override the micro threshold (default: 128).
-    /// Token groups with fewer than this many vectors receive 1 centroid each.
-    pub fn micro_threshold(mut self, micro_threshold: usize) -> Self {
-        self.micro_threshold = Some(micro_threshold);
-        self
-    }
-
-    /// Override the small threshold (default: 256).
-    /// Token groups in `[micro_threshold, small_threshold)` receive 2 centroids each.
-    pub fn small_threshold(mut self, small_threshold: usize) -> Self {
-        self.small_threshold = Some(small_threshold);
+    pub fn alloc_params(mut self, alloc_params: TacAllocParams) -> Self {
+        self.alloc_params = alloc_params;
         self
     }
 
@@ -142,8 +126,7 @@ impl TacBuilder {
             n_iter: self.n_iter,
             verbose: self.verbose,
             max_sample_size: self.max_sample_size,
-            micro_threshold: self.micro_threshold,
-            small_threshold: self.small_threshold,
+            alloc_params: self.alloc_params,
         }
     }
 }
@@ -159,8 +142,7 @@ pub struct TokenAwareClustering {
     n_iter: usize,
     verbose: bool,
     max_sample_size: Option<usize>,
-    micro_threshold: Option<usize>,
-    small_threshold: Option<usize>,
+    alloc_params: TacAllocParams,
 }
 
 impl Default for TokenAwareClustering {
@@ -235,8 +217,9 @@ impl TokenAwareClustering {
         // If the budget cannot cover even these floors, TAC produces meaningless
         // per-type clusters and panics during assignment lookup.
         // Fall back to a single global k-means on all vectors instead.
-        let micro_threshold = self.micro_threshold.unwrap_or(DEFAULT_MICRO_THRESHOLD);
-        let small_threshold = self.small_threshold.unwrap_or(DEFAULT_SMALL_THRESHOLD);
+        let micro_threshold = self.alloc_params.micro_threshold;
+        let small_threshold = self.alloc_params.small_threshold;
+        let hard_floor = self.alloc_params.hard_floor;
         let n_micro = token_groups
             .values()
             .filter(|v| v.len() < micro_threshold)
@@ -249,15 +232,15 @@ impl TokenAwareClustering {
             .values()
             .filter(|v| v.len() >= small_threshold)
             .count();
-        let min_tac_budget = n_micro + n_small * 2 + n_active * 4;
+        let min_tac_budget = n_micro + n_small * 2 + n_active * hard_floor;
 
         if total_centroids < min_tac_budget {
             eprintln!(
                 "[TAC] Warning: total_centroids ({}) < minimum TAC budget \
-                 ({} = {}×1 + {}×2 + {}×4). \
+                 ({} = {}×1 + {}×2 + {}×{}). \
                  TAC is designed for large-scale datasets; falling back to \
                  global k-means.",
-                total_centroids, min_tac_budget, n_micro, n_small, n_active
+                total_centroids, min_tac_budget, n_micro, n_small, n_active, hard_floor
             );
             let all_indices: Vec<usize> = (0..n_vectors).collect();
             let (centroids, assignments) = train_kmeans_for_token(
@@ -267,6 +250,7 @@ impl TokenAwareClustering {
                 total_centroids,
                 self.n_iter,
                 self.max_sample_size,
+                self.alloc_params.min_pts_per_centroid,
             );
             return TacResult {
                 centroids: centroids.values().to_vec(),
@@ -282,15 +266,19 @@ impl TokenAwareClustering {
             data,
             dim,
             total_centroids,
-            micro_threshold,
-            small_threshold,
             self.verbose,
+            &self.alloc_params,
         );
 
         // ── Per-token k-means (parallel) ──────────────────────────────────────
+        let n_groups = token_groups.len();
         if self.verbose {
-            println!("\n=== Training per-token k-means ===");
+            println!("\n=== Training per-token k-means ({} groups) ===", n_groups);
         }
+
+        let completed = AtomicUsize::new(0);
+        let print_every = (n_groups / 20).max(1); // ~5% intervals
+        let kmeans_start = Instant::now();
 
         let results: Vec<(
             usize,
@@ -307,7 +295,18 @@ impl TokenAwareClustering {
                     k,
                     self.n_iter,
                     self.max_sample_size,
+                    self.alloc_params.min_pts_per_centroid,
                 );
+                let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                if self.verbose && (done % print_every == 0 || done == n_groups) {
+                    println!(
+                        "  k-means: {}/{} groups ({:.0}%) — {:.1}s elapsed",
+                        done,
+                        n_groups,
+                        100.0 * done as f64 / n_groups as f64,
+                        kmeans_start.elapsed().as_secs_f64(),
+                    );
+                }
                 (token_id, centroids, local_assignments)
             })
             .collect();
@@ -374,6 +373,7 @@ fn train_kmeans_for_token(
     k: usize,
     n_iter: usize,
     max_sample_size: Option<usize>,
+    min_pts_per_centroid: usize,
 ) -> (PlainDenseDataset<f16, SquaredEuclideanDistance>, Vec<u32>) {
     let encoder = PlainDenseQuantizer::<f16, SquaredEuclideanDistance>::new(dim);
 
@@ -387,17 +387,16 @@ fn train_kmeans_for_token(
     let n = indices.len();
 
     // Determine training sample size.
-    // When n > 1M, cap training at min(10M, n, max(1M, 2·39·k, n/(2·n_iter)))
+    // When n > 1M, cap training at min(10M, n, max(1M, 2·θ·k, n/(2·n_iter)))
     // so that head tokens (millions of vectors, small k) don't dominate training time.
     const AUTO_THRESHOLD: usize = 1_000_000;
     const AUTO_MAX: usize = 10_000_000;
-    const MIN_PTS_PER_CENTROID: usize = 39;
 
     let training_n = match max_sample_size {
         Some(cap) => cap.min(n),
         None => {
             if n > AUTO_THRESHOLD {
-                let by_cluster = 2 * MIN_PTS_PER_CENTROID * k;
+                let by_cluster = 2 * min_pts_per_centroid * k;
                 let by_iter = n / (2 * n_iter).max(1);
                 let candidate = AUTO_THRESHOLD.max(by_cluster).max(by_iter);
                 AUTO_MAX.min(n).min(candidate)

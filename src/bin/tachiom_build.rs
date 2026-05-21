@@ -5,6 +5,7 @@ use std::io::{BufReader, Read};
 use std::time::Instant;
 
 use tachiom::hnsw::HNSWBuildConfiguration;
+use tachiom::tac::TacAllocParams;
 use tachiom::tachiom::{Tachiom, TachiomBuildParams, TachiomInputDataset};
 use vectorium::core::index::Index;
 use vectorium::{IndexSerializer, MultiVectorDataset, PlainMultiVecQuantizer};
@@ -47,6 +48,14 @@ struct Args {
     /// TAC small threshold: token groups in [micro, small) get 2 centroids each
     #[clap(long, default_value_t = 256)]
     tac_small_threshold: usize,
+
+    /// TAC hard floor for active token groups
+    #[clap(long, default_value_t = 4)]
+    tac_hard_floor: usize,
+
+    /// Minimum points per TAC centroid
+    #[clap(long, default_value_t = 39)]
+    tac_min_pts_per_centroid: usize,
 
     /// Tokens sampled for PQ training
     #[clap(long, default_value_t = 10_000_000)]
@@ -167,8 +176,12 @@ fn main() -> anyhow::Result<()> {
         token_ids,
         total_centroids: args.total_centroids,
         tac_n_iter: args.tac_n_iter,
-        tac_micro_threshold: Some(args.tac_micro_threshold),
-        tac_small_threshold: Some(args.tac_small_threshold),
+        tac_alloc_params: TacAllocParams {
+            micro_threshold: args.tac_micro_threshold,
+            small_threshold: args.tac_small_threshold,
+            hard_floor: args.tac_hard_floor,
+            min_pts_per_centroid: args.tac_min_pts_per_centroid,
+        },
         pq_sample_size: args.pq_sample_size,
         pq_n_iter: args.pq_n_iter,
         normalize: args.normalize,

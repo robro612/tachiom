@@ -5,7 +5,7 @@
 
 use crate::hnsw::HNSWBuildConfiguration;
 use crate::pgc::{EmptyAnchorStrategy, PgcBuilder};
-use crate::tac::{TacBuilder, TacResult};
+use crate::tac::{TacAllocParams, TacBuilder, TacResult};
 use crate::tachiom::{Tachiom, TachiomBuildParams, TachiomInputDataset};
 use vectorium::core::index::Index;
 use vectorium::vector_encoder::{MultiVecEncoder, VectorEncoder};
@@ -43,6 +43,8 @@ struct ResolvedTacParams {
     total_centroids: usize,
     micro_threshold: usize,
     small_threshold: usize,
+    hard_floor: usize,
+    min_pts_per_centroid: usize,
     /// Saturation cap: adding more centroids beyond this is pointless.
     sat_cap: usize,
     /// Raw power-of-2 formula value, before floor / cap.
@@ -59,6 +61,8 @@ fn resolve_tac_params(
     total_centroids_override: Option<usize>,
     micro_override: Option<usize>,
     small_override: Option<usize>,
+    hard_floor_override: Option<usize>,
+    min_pts_per_centroid_override: Option<usize>,
 ) -> ResolvedTacParams {
     let n_tokens = token_ids.len().max(128);
 
@@ -72,6 +76,8 @@ fn resolve_tac_params(
     let small_auto = micro_auto * 2;
     let micro = micro_override.unwrap_or(micro_auto);
     let small = small_override.unwrap_or(small_auto);
+    let hard_floor = hard_floor_override.unwrap_or(4);
+    let min_pts_per_centroid = min_pts_per_centroid_override.unwrap_or(MIN_PTS_PER_CENTROID);
 
     // Token-type frequency histogram.
     let mut freq: HashMap<u32, usize> = HashMap::new();
@@ -94,8 +100,8 @@ fn resolve_tac_params(
         }
     }
 
-    let min_budget = n_micro_t + n_small_t * 2 + n_active_t * 4;
-    let sat_cap = n_micro_t + n_small_t * 2 + total_active_tokens / MIN_PTS_PER_CENTROID;
+    let min_budget = n_micro_t + n_small_t * 2 + n_active_t * hard_floor;
+    let sat_cap = n_micro_t + n_small_t * 2 + total_active_tokens / min_pts_per_centroid;
 
     // TAC floor: enough to run TAC with buffer, but never above sat_cap.
     let tac_floor = ((min_budget as f64 * TAC_FLOOR_FACTOR).ceil() as usize).min(sat_cap);
@@ -110,6 +116,8 @@ fn resolve_tac_params(
         total_centroids,
         micro_threshold: micro,
         small_threshold: small,
+        hard_floor,
+        min_pts_per_centroid,
         sat_cap,
         formula,
         was_capped,
@@ -123,7 +131,8 @@ fn resolve_tac_params(
 /// Compute recommended TAC build parameters from a flat token-ID array.
 ///
 /// Returns a dict with keys ``total_centroids``, ``tac_micro_threshold``,
-/// ``tac_small_threshold``, ``sat_cap``, and ``formula``.
+/// ``tac_small_threshold``, ``tac_hard_floor``,
+/// ``tac_min_pts_per_centroid``, ``sat_cap``, and ``formula``.
 ///
 /// Any kwarg set to a non-``None`` value overrides the heuristic for that
 /// parameter; ``None`` (default) triggers full auto-computation.
@@ -137,6 +146,8 @@ fn resolve_tac_params(
     total_centroids = None,
     tac_micro_threshold = None,
     tac_small_threshold = None,
+    tac_hard_floor = None,
+    tac_min_pts_per_centroid = None,
 ))]
 fn auto_build_params(
     py: Python<'_>,
@@ -144,6 +155,8 @@ fn auto_build_params(
     total_centroids: Option<usize>,
     tac_micro_threshold: Option<usize>,
     tac_small_threshold: Option<usize>,
+    tac_hard_floor: Option<usize>,
+    tac_min_pts_per_centroid: Option<usize>,
 ) -> PyResult<Py<PyDict>> {
     let ids = token_ids
         .as_slice()
@@ -154,6 +167,8 @@ fn auto_build_params(
         total_centroids,
         tac_micro_threshold,
         tac_small_threshold,
+        tac_hard_floor,
+        tac_min_pts_per_centroid,
     );
 
     if p.was_capped {
@@ -172,6 +187,8 @@ fn auto_build_params(
     dict.set_item("total_centroids", p.total_centroids)?;
     dict.set_item("tac_micro_threshold", p.micro_threshold)?;
     dict.set_item("tac_small_threshold", p.small_threshold)?;
+    dict.set_item("tac_hard_floor", p.hard_floor)?;
+    dict.set_item("tac_min_pts_per_centroid", p.min_pts_per_centroid)?;
     dict.set_item("sat_cap", p.sat_cap)?;
     dict.set_item("formula", p.formula)?;
     Ok(dict.into())
@@ -213,6 +230,8 @@ impl PyTachiom {
         tac_n_iter = None,
         tac_micro_threshold = None,
         tac_small_threshold = None,
+        tac_hard_floor = None,
+        tac_min_pts_per_centroid = None,
         pq_sample_size = None,
         pq_n_iter = None,
         normalize = None,
@@ -233,6 +252,8 @@ impl PyTachiom {
         tac_n_iter: Option<usize>,
         tac_micro_threshold: Option<usize>,
         tac_small_threshold: Option<usize>,
+        tac_hard_floor: Option<usize>,
+        tac_min_pts_per_centroid: Option<usize>,
         pq_sample_size: Option<usize>,
         pq_n_iter: Option<usize>,
         normalize: Option<bool>,
@@ -258,6 +279,8 @@ impl PyTachiom {
             total_centroids,
             tac_micro_threshold,
             tac_small_threshold,
+            tac_hard_floor,
+            tac_min_pts_per_centroid,
         );
         if resolved.was_capped {
             warn_saturation_cap(py, total_centroids.unwrap(), resolved.sat_cap)?;
@@ -267,8 +290,12 @@ impl PyTachiom {
             token_ids,
             total_centroids: resolved.total_centroids,
             tac_n_iter,
-            tac_micro_threshold: Some(resolved.micro_threshold),
-            tac_small_threshold: Some(resolved.small_threshold),
+            tac_alloc_params: TacAllocParams {
+                micro_threshold: resolved.micro_threshold,
+                small_threshold: resolved.small_threshold,
+                hard_floor: resolved.hard_floor,
+                min_pts_per_centroid: resolved.min_pts_per_centroid,
+            },
             pq_sample_size,
             pq_n_iter,
             normalize,
@@ -300,6 +327,8 @@ impl PyTachiom {
         tac_n_iter = None,
         tac_micro_threshold = None,
         tac_small_threshold = None,
+        tac_hard_floor = None,
+        tac_min_pts_per_centroid = None,
         pq_sample_size = None,
         pq_n_iter = None,
         normalize = None,
@@ -320,6 +349,8 @@ impl PyTachiom {
         tac_n_iter: Option<usize>,
         tac_micro_threshold: Option<usize>,
         tac_small_threshold: Option<usize>,
+        tac_hard_floor: Option<usize>,
+        tac_min_pts_per_centroid: Option<usize>,
         pq_sample_size: Option<usize>,
         pq_n_iter: Option<usize>,
         normalize: Option<bool>,
@@ -347,6 +378,8 @@ impl PyTachiom {
             total_centroids,
             tac_micro_threshold,
             tac_small_threshold,
+            tac_hard_floor,
+            tac_min_pts_per_centroid,
         );
         if resolved.was_capped {
             warn_saturation_cap(py, total_centroids.unwrap(), resolved.sat_cap)?;
@@ -356,8 +389,12 @@ impl PyTachiom {
             token_ids: token_ids_vec,
             total_centroids: resolved.total_centroids,
             tac_n_iter,
-            tac_micro_threshold: Some(resolved.micro_threshold),
-            tac_small_threshold: Some(resolved.small_threshold),
+            tac_alloc_params: TacAllocParams {
+                micro_threshold: resolved.micro_threshold,
+                small_threshold: resolved.small_threshold,
+                hard_floor: resolved.hard_floor,
+                min_pts_per_centroid: resolved.min_pts_per_centroid,
+            },
             pq_sample_size,
             pq_n_iter,
             normalize,
@@ -427,9 +464,10 @@ impl PyTachiom {
         let empty_strategy = match pgc_empty_strategy {
             "resample" => EmptyAnchorStrategy::Resample,
             "remove" => EmptyAnchorStrategy::Remove,
+            "split" => EmptyAnchorStrategy::Split,
             other => {
                 return Err(PyValueError::new_err(format!(
-                    "pgc_empty_strategy must be \"resample\" or \"remove\", got {:?}",
+                    "pgc_empty_strategy must be \"resample\", \"remove\", or \"split\", got {:?}",
                     other
                 )))
             }
@@ -452,6 +490,7 @@ impl PyTachiom {
             token_ids: token_ids_vec,
             total_centroids,
             tac_n_iter: 0,
+            tac_alloc_params: Default::default(),
             pq_sample_size,
             pq_n_iter,
             normalize,
@@ -459,6 +498,7 @@ impl PyTachiom {
             hnsw_params: HNSWBuildConfiguration::default()
                 .with_num_neighbors(hnsw_m)
                 .with_ef_construction(ef_construction),
+            center_dataset: false,
         };
 
         // Run PGC outside the GIL, then hand centroids+assignments to build_index_from_tac.
@@ -542,8 +582,7 @@ impl PyTachiom {
             token_ids,
             total_centroids: n_centroids, // unused by build_index_from_tac, required by struct
             tac_n_iter: 0,                // unused
-            tac_micro_threshold: None,    // unused
-            tac_small_threshold: None,    // unused
+            tac_alloc_params: Default::default(),
             pq_sample_size,
             pq_n_iter,
             normalize,
