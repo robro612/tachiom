@@ -512,9 +512,9 @@ impl PyTachiom {
             let n_tokens = dataset.values().len() / dim;
             let n_req = total_centroids.min(n_tokens);
 
-            let flat_f16: Vec<f16> = dataset.values().to_vec();
-            let pgc_result = pgc.cluster(&flat_f16, dim, n_req);
-            drop(flat_f16);
+            // Borrow dataset.values() for PGC; the borrow ends when cluster() returns,
+            // so dataset can then be moved into build_index_from_tac without a clone.
+            let pgc_result = pgc.cluster(dataset.values(), dim, n_req);
 
             Tachiom::<M_FIXED>::build_index_from_tac(
                 pgc_result.centroids,
