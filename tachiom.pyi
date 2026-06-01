@@ -13,6 +13,19 @@ import numpy as np
 from numpy.typing import NDArray
 
 
+def auto_build_params(
+    token_ids: NDArray[np.uint32],
+    *,
+    total_centroids: int | None = None,
+    tac_micro_threshold: int | None = None,
+    tac_small_threshold: int | None = None,
+    tac_hard_floor: int | None = None,
+    tac_min_pts_per_centroid: int | None = None,
+) -> dict[str, int]:
+    """Compute resolved TAC build parameters for a token-id array."""
+    ...
+
+
 class Tac:
     """Token-Aware Clustering for multivector data.
 
@@ -114,6 +127,8 @@ class Tachiom:
         tac_n_iter: int | None = None,
         tac_micro_threshold: int | None = None,
         tac_small_threshold: int | None = None,
+        tac_hard_floor: int | None = None,
+        tac_min_pts_per_centroid: int | None = None,
         pq_sample_size: int | None = None,
         pq_n_iter: int | None = None,
         normalize: bool | None = None,
@@ -130,6 +145,8 @@ class Tachiom:
             tac_n_iter:          10
             tac_micro_threshold: auto (2^round(log2(n_tokens^0.25)) clamped to [32, 128])
             tac_small_threshold: auto (2 × tac_micro_threshold)
+            tac_hard_floor:      4
+            tac_min_pts_per_centroid: 39
             pq_sample_size:      10_000_000
             pq_n_iter:           10
             normalize:           True (L2-normalise residuals before PQ encoding)
@@ -152,6 +169,8 @@ class Tachiom:
         tac_n_iter: int | None = None,
         tac_micro_threshold: int | None = None,
         tac_small_threshold: int | None = None,
+        tac_hard_floor: int | None = None,
+        tac_min_pts_per_centroid: int | None = None,
         pq_sample_size: int | None = None,
         pq_n_iter: int | None = None,
         normalize: bool | None = None,
@@ -174,6 +193,37 @@ class Tachiom:
                        format written by the indexing pipeline.
             token_ids: [N] u32, vocabulary id per token.
             doclens:   [n_docs] i32, tokens per document.
+        """
+        ...
+
+    @classmethod
+    def build_with_pgc(
+        cls,
+        vectors: NDArray[np.uint16],
+        token_ids: NDArray[np.uint32],
+        doclens: NDArray[np.int32],
+        *,
+        total_centroids: int | None = None,
+        pgc_n_iter: int = 10,
+        pgc_sample_multiplier: int = 5,
+        pgc_empty_strategy: str = "resample",
+        pgc_iter_hnsw_m: int = 16,
+        pgc_iter_ef_construction: int = 200,
+        pgc_iter_ef_search: int = 50,
+        pgc_seed: int = 42,
+        pq_sample_size: int | None = None,
+        pq_n_iter: int | None = None,
+        normalize: bool | None = None,
+        pq_seed: int | None = None,
+        hnsw_m: int | None = None,
+        ef_construction: int | None = None,
+        pq_subspaces: int = 32,
+    ) -> Tachiom:
+        """Build an index using Proximity Graph Clustering instead of TAC.
+
+        PGC clusters token vectors directly, without using token-type groups.
+        Shared build keyword arguments follow build() defaults.  pgc_empty_strategy
+        must be one of "resample", "remove", or "split".
         """
         ...
 
@@ -227,7 +277,7 @@ class Tachiom:
         *,
         k_centroids: int = 20,
         k_docs_to_score: int = 500,
-        ef_search: int = 30,
+        ef_search: Optional[int] = None,
         alpha: Optional[float] = 0.45,
         beta: Optional[int] = None,
         lambda_: Optional[float] = None,
@@ -255,7 +305,7 @@ class Tachiom:
         num_threads: int = 0,
         k_centroids: int = 20,
         k_docs_to_score: int = 500,
-        ef_search: int = 30,
+        ef_search: Optional[int] = None,
         alpha: Optional[float] = 0.45,
         beta: Optional[int] = None,
         lambda_: Optional[float] = None,

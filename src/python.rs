@@ -420,7 +420,7 @@ impl PyTachiom {
         token_ids,
         doclens,
         *,
-        total_centroids = 4_194_304,
+        total_centroids = None,
         pgc_n_iter = 10,
         pgc_sample_multiplier = 5,
         pgc_empty_strategy = "resample",
@@ -428,12 +428,12 @@ impl PyTachiom {
         pgc_iter_ef_construction = 200,
         pgc_iter_ef_search = 50,
         pgc_seed = 42,
-        pq_sample_size = 10_000_000,
-        pq_n_iter = 10,
-        normalize = false,
-        pq_seed = 42,
-        hnsw_m = 32,
-        ef_construction = 1500,
+        pq_sample_size = None,
+        pq_n_iter = None,
+        normalize = None,
+        pq_seed = None,
+        hnsw_m = None,
+        ef_construction = None,
         pq_subspaces = 32,
     ))]
     #[allow(clippy::too_many_arguments)]
@@ -443,7 +443,7 @@ impl PyTachiom {
         vectors: PyReadonlyArray2<'_, u16>,
         token_ids: PyReadonlyArray1<'_, u32>,
         doclens: PyReadonlyArray1<'_, i32>,
-        total_centroids: usize,
+        total_centroids: Option<usize>,
         pgc_n_iter: usize,
         pgc_sample_multiplier: usize,
         pgc_empty_strategy: &str,
@@ -451,15 +451,21 @@ impl PyTachiom {
         pgc_iter_ef_construction: usize,
         pgc_iter_ef_search: usize,
         pgc_seed: u64,
-        pq_sample_size: usize,
-        pq_n_iter: usize,
-        normalize: bool,
-        pq_seed: u64,
-        hnsw_m: usize,
-        ef_construction: usize,
+        pq_sample_size: Option<usize>,
+        pq_n_iter: Option<usize>,
+        normalize: Option<bool>,
+        pq_seed: Option<u64>,
+        hnsw_m: Option<usize>,
+        ef_construction: Option<usize>,
         pq_subspaces: usize,
     ) -> PyResult<Self> {
         warn_pq_subspaces(py, pq_subspaces)?;
+        let pq_sample_size = pq_sample_size.unwrap_or(10_000_000);
+        let pq_n_iter = pq_n_iter.unwrap_or(10);
+        let normalize = normalize.unwrap_or(true);
+        let pq_seed = pq_seed.unwrap_or(42);
+        let hnsw_m = hnsw_m.unwrap_or(32);
+        let ef_construction = ef_construction.unwrap_or(1500);
 
         let empty_strategy = match pgc_empty_strategy {
             "resample" => EmptyAnchorStrategy::Resample,
@@ -469,11 +475,18 @@ impl PyTachiom {
                 return Err(PyValueError::new_err(format!(
                     "pgc_empty_strategy must be \"resample\", \"remove\", or \"split\", got {:?}",
                     other
-                )))
+                )));
             }
         };
 
         let (dataset, token_ids_vec) = dataset_from_arrays(&vectors, &token_ids, &doclens)?;
+        let ids_u32 = token_ids
+            .as_slice()
+            .map_err(|_| PyValueError::new_err("token_ids must be C-contiguous"))?;
+        let resolved = resolve_tac_params(ids_u32, total_centroids, None, None, None, None);
+        if resolved.was_capped {
+            warn_saturation_cap(py, total_centroids.unwrap(), resolved.sat_cap)?;
+        }
 
         let pgc = PgcBuilder::new()
             .n_iter(pgc_n_iter)
@@ -488,7 +501,7 @@ impl PyTachiom {
 
         let params = TachiomBuildParams {
             token_ids: token_ids_vec,
-            total_centroids,
+            total_centroids: resolved.total_centroids,
             tac_n_iter: 0,
             tac_alloc_params: Default::default(),
             pq_sample_size,
@@ -502,15 +515,10 @@ impl PyTachiom {
         };
 
         // Run PGC outside the GIL, then hand centroids+assignments to build_index_from_tac.
-        //
-        // We need a cloned copy of the flat data for PGC because PGC borrows it
-        // throughout the iteration loop while `dataset` must stay alive for the
-        // subsequent build step (which takes ownership of `dataset`).
-        // The clone is freed immediately after PGC returns.
         let inner = py.allow_threads(|| {
             let dim = dataset.encoder().input_dim();
             let n_tokens = dataset.values().len() / dim;
-            let n_req = total_centroids.min(n_tokens);
+            let n_req = resolved.total_centroids.min(n_tokens);
 
             // Borrow dataset.values() for PGC; the borrow ends when cluster() returns,
             // so dataset can then be moved into build_index_from_tac without a clone.

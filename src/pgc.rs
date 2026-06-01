@@ -207,21 +207,29 @@ impl ProximityGraphClustering {
         }
         let mut n_active = n_centroids;
 
-        let search_config = HNSWSearchConfiguration::default()
-            .with_ef_search(self.iter_ef_search);
+        let search_config = HNSWSearchConfiguration::default().with_ef_search(self.iter_ef_search);
 
         // ── Step 2: Iterative refinement ──────────────────────────────────────
         for iter in 0..self.n_iter {
             if n_active == 0 {
                 if self.verbose {
-                    println!("  PGC: all anchors removed before iter {} — stopping early", iter + 1);
+                    println!(
+                        "  PGC: all anchors removed before iter {} — stopping early",
+                        iter + 1
+                    );
                 }
                 break;
             }
 
             let iter_start = Instant::now();
 
-            let hnsw = build_anchor_hnsw(&anchors, n_active, dim, self.iter_hnsw_m, self.iter_ef_construction);
+            let hnsw = build_anchor_hnsw(
+                &anchors,
+                n_active,
+                dim,
+                self.iter_hnsw_m,
+                self.iter_ef_construction,
+            );
 
             // Sample `n_active * sample_multiplier` random vector indices (with replacement).
             let sample_n = (n_active * self.sample_multiplier).min(n_vectors);
@@ -240,7 +248,11 @@ impl ProximityGraphClustering {
                         .map(|x| x.to_f32())
                         .collect();
                     let hits = hnsw.search(DenseVectorView::new(&q), 1, &search_config);
-                    if hits.is_empty() { 0 } else { hits[0].vector as usize }
+                    if hits.is_empty() {
+                        0
+                    } else {
+                        hits[0].vector as usize
+                    }
                 })
                 .collect();
 
@@ -312,7 +324,11 @@ impl ProximityGraphClustering {
                         .iter()
                         .zip(iter_assignments.iter())
                         .filter_map(|(&vidx, &aidx)| {
-                            if aidx.min(n_active - 1) == max_anchor { Some(vidx) } else { None }
+                            if aidx.min(n_active - 1) == max_anchor {
+                                Some(vidx)
+                            } else {
+                                None
+                            }
                         })
                         .collect();
 
@@ -395,7 +411,11 @@ impl ProximityGraphClustering {
                     .map(|x| x.to_f32())
                     .collect();
                 let hits = final_hnsw.search(DenseVectorView::new(&q), 1, &search_config);
-                let anchor = if hits.is_empty() { 0 } else { hits[0].vector as usize };
+                let anchor = if hits.is_empty() {
+                    0
+                } else {
+                    hits[0].vector as usize
+                };
                 if verbose {
                     let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
                     if done % print_every == 0 || done == n_vectors {
