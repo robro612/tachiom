@@ -25,9 +25,9 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, Read};
 
-/// PQ subspace count.  Hard-coded to match the rest of the codebase; the public
-/// `pq_subspaces` kwarg is validated against this value (warns if different).
-const M_FIXED: usize = 32;
+// PQ subspace count `M` is a compile-time const generic; the supported variants
+// (32, 64) are dispatched at runtime via the `TachiomInner` enum below, selected
+// by the `pq_subspaces` kwarg.  Default is 32 (see each constructor's signature).
 
 /// Minimum points per centroid — mirrors the TAC allocation strategy constant.
 const MIN_PTS_PER_CENTROID: usize = 39;
@@ -195,6 +195,314 @@ fn auto_build_params(
 }
 
 // ============================================================================
+// Clustering-only timing helpers (benchmark / analysis use)
+// ============================================================================
+//
+// These reproduce the *exact* coarse-clustering call made by the real build
+// path (`build_from_arrays` for TAC, `build_with_pgc` for PGC) — same dataset
+// construction, same resolved centroid budget, same params — but skip the
+// PQ/HNSW stages entirely.  The numpy→Rust copy happens *outside* the timer,
+// so the returned `elapsed_s` measures only the clustering routine.  Passing
+// `total_centroids=None` reproduces the production centroid budget exactly
+// (identical resolver as the index build).
+
+/// Time ONLY the TAC coarse-clustering step on in-memory arrays.
+#[pyfunction]
+#[pyo3(signature = (
+    vectors,
+    token_ids,
+    doclens,
+    *,
+    total_centroids = None,
+    tac_n_iter = 10,
+    tac_micro_threshold = None,
+    tac_small_threshold = None,
+    max_sample_size = None,
+))]
+#[allow(clippy::too_many_arguments)]
+fn time_tac_clustering(
+    py: Python<'_>,
+    vectors: PyReadonlyArray2<'_, u16>,
+    token_ids: PyReadonlyArray1<'_, u32>,
+    doclens: PyReadonlyArray1<'_, i32>,
+    total_centroids: Option<usize>,
+    tac_n_iter: usize,
+    tac_micro_threshold: Option<usize>,
+    tac_small_threshold: Option<usize>,
+    max_sample_size: Option<usize>,
+) -> PyResult<Py<PyDict>> {
+    let (dataset, token_ids_vec) = dataset_from_arrays(&vectors, &token_ids, &doclens)?;
+    let ids_u32 = token_ids
+        .as_slice()
+        .map_err(|_| PyValueError::new_err("token_ids must be C-contiguous"))?;
+    let resolved = resolve_tac_params(
+        ids_u32,
+        total_centroids,
+        tac_micro_threshold,
+        tac_small_threshold,
+        None,
+        None,
+    );
+    // Mirror build_from_arrays' TacBuilder construction exactly.
+    let tac = TacBuilder::new()
+        .n_iter(tac_n_iter)
+        .verbose(false)
+        .max_sample_size(max_sample_size)
+        .alloc_params(TacAllocParams {
+            micro_threshold: resolved.micro_threshold,
+            small_threshold: resolved.small_threshold,
+            hard_floor: resolved.hard_floor,
+            min_pts_per_centroid: resolved.min_pts_per_centroid,
+        })
+        .build();
+    let dim = dataset.encoder().input_dim();
+    let budget = resolved.total_centroids;
+    let n_tokens = dataset.values().len() / dim;
+
+    let (elapsed_s, n_centroids) = py.allow_threads(|| {
+        let start = std::time::Instant::now();
+        let r: TacResult = tac.train(dataset.values(), dim, &token_ids_vec, budget);
+        (start.elapsed().as_secs_f64(), r.n_centroids)
+    });
+
+    let dict = PyDict::new(py);
+    dict.set_item("clustering", "tac")?;
+    dict.set_item("elapsed_s", elapsed_s)?;
+    dict.set_item("n_centroids", n_centroids)?;
+    dict.set_item("requested_centroids", budget)?;
+    dict.set_item("n_tokens", n_tokens)?;
+    dict.set_item("dim", dim)?;
+    dict.set_item("tac_n_iter", tac_n_iter)?;
+    Ok(dict.into())
+}
+
+/// Time ONLY the PGC coarse-clustering step on in-memory arrays.
+#[pyfunction]
+#[pyo3(signature = (
+    vectors,
+    token_ids,
+    doclens,
+    *,
+    total_centroids = None,
+    pgc_n_iter = 10,
+    pgc_sample_multiplier = 5,
+    pgc_empty_strategy = "resample",
+    pgc_iter_hnsw_m = 16,
+    pgc_iter_ef_construction = 200,
+    pgc_iter_ef_search = 50,
+    pgc_iter_lambda = None,
+    pgc_assign_topm = 1,
+    pgc_assign_temp = 0.1,
+    pgc_seed = 42,
+))]
+#[allow(clippy::too_many_arguments)]
+fn time_pgc_clustering(
+    py: Python<'_>,
+    vectors: PyReadonlyArray2<'_, u16>,
+    token_ids: PyReadonlyArray1<'_, u32>,
+    doclens: PyReadonlyArray1<'_, i32>,
+    total_centroids: Option<usize>,
+    pgc_n_iter: usize,
+    pgc_sample_multiplier: usize,
+    pgc_empty_strategy: &str,
+    pgc_iter_hnsw_m: usize,
+    pgc_iter_ef_construction: usize,
+    pgc_iter_ef_search: usize,
+    pgc_iter_lambda: Option<f32>,
+    pgc_assign_topm: usize,
+    pgc_assign_temp: f32,
+    pgc_seed: u64,
+) -> PyResult<Py<PyDict>> {
+    let empty_strategy = match pgc_empty_strategy {
+        "resample" => EmptyAnchorStrategy::Resample,
+        "remove" => EmptyAnchorStrategy::Remove,
+        "split" => EmptyAnchorStrategy::Split,
+        other => {
+            return Err(PyValueError::new_err(format!(
+                "pgc_empty_strategy must be \"resample\", \"remove\", or \"split\", got {:?}",
+                other
+            )));
+        }
+    };
+    // token_ids feed the centroid-budget resolver only (PGC ignores token types);
+    // this keeps the requested centroid count identical to the TAC/index path.
+    let (dataset, _token_ids_vec) = dataset_from_arrays(&vectors, &token_ids, &doclens)?;
+    let ids_u32 = token_ids
+        .as_slice()
+        .map_err(|_| PyValueError::new_err("token_ids must be C-contiguous"))?;
+    let resolved = resolve_tac_params(ids_u32, total_centroids, None, None, None, None);
+
+    // Mirror build_with_pgc's PgcBuilder construction exactly.
+    let pgc = PgcBuilder::new()
+        .n_iter(pgc_n_iter)
+        .sample_multiplier(pgc_sample_multiplier)
+        .empty_strategy(empty_strategy)
+        .iter_hnsw_m(pgc_iter_hnsw_m)
+        .iter_ef_construction(pgc_iter_ef_construction)
+        .iter_ef_search(pgc_iter_ef_search)
+        .iter_lambda(pgc_iter_lambda)
+        .assign_topm(pgc_assign_topm)
+        .assign_temp(pgc_assign_temp)
+        .seed(pgc_seed)
+        .verbose(false)
+        .build();
+    let dim = dataset.encoder().input_dim();
+    let n_tokens = dataset.values().len() / dim;
+    let n_req = resolved.total_centroids.min(n_tokens);
+
+    let (elapsed_s, n_centroids) = py.allow_threads(|| {
+        let start = std::time::Instant::now();
+        let r = pgc.cluster(dataset.values(), dim, n_req);
+        (start.elapsed().as_secs_f64(), r.n_centroids)
+    });
+
+    let dict = PyDict::new(py);
+    dict.set_item("clustering", "pgc")?;
+    dict.set_item("elapsed_s", elapsed_s)?;
+    dict.set_item("n_centroids", n_centroids)?;
+    dict.set_item("requested_centroids", n_req)?;
+    dict.set_item("n_tokens", n_tokens)?;
+    dict.set_item("dim", dim)?;
+    dict.set_item("pgc_n_iter", pgc_n_iter)?;
+    dict.set_item("pgc_iter_ef_search", pgc_iter_ef_search)?;
+    dict.set_item("pgc_iter_lambda", pgc_iter_lambda)?;
+    dict.set_item("pgc_assign_topm", pgc_assign_topm)?;
+    dict.set_item("pgc_assign_temp", pgc_assign_temp)?;
+    dict.set_item("pgc_sample_multiplier", pgc_sample_multiplier)?;
+    Ok(dict.into())
+}
+
+// ============================================================================
+// Standalone clustering: produce (centroids, assignments) for reuse.
+// ============================================================================
+//
+// Decouples the *clustering* step from index building: run TAC/PGC once, save
+// the centroids + per-token assignments, then build any number of downstream
+// indexes (varying PQ / HNSW / search params) via
+// `Tachiom.build_from_arrays_with_centroids` (clustering="external") WITHOUT
+// re-clustering — clustering is the expensive part (PGC minutes-to-hours, TAC
+// up to hours at high centroid budgets), so caching it saves most of the
+// indexing time.  Returns (centroids [n_centroids, dim] f32, assignments
+// [n_tokens] u32) in the same token order the build path uses.
+
+/// Run TAC clustering only; return (centroids, assignments).
+#[pyfunction]
+#[pyo3(signature = (
+    vectors, token_ids, doclens, *,
+    total_centroids = None, tac_n_iter = 10,
+    tac_micro_threshold = None, tac_small_threshold = None, max_sample_size = None,
+))]
+#[allow(clippy::too_many_arguments)]
+fn cluster_tac(
+    py: Python<'_>,
+    vectors: PyReadonlyArray2<'_, u16>,
+    token_ids: PyReadonlyArray1<'_, u32>,
+    doclens: PyReadonlyArray1<'_, i32>,
+    total_centroids: Option<usize>,
+    tac_n_iter: usize,
+    tac_micro_threshold: Option<usize>,
+    tac_small_threshold: Option<usize>,
+    max_sample_size: Option<usize>,
+) -> PyResult<(Py<PyArray2<f32>>, Py<PyArray1<u32>>)> {
+    let (dataset, token_ids_vec) = dataset_from_arrays(&vectors, &token_ids, &doclens)?;
+    let ids_u32 = token_ids
+        .as_slice()
+        .map_err(|_| PyValueError::new_err("token_ids must be C-contiguous"))?;
+    let resolved = resolve_tac_params(
+        ids_u32, total_centroids, tac_micro_threshold, tac_small_threshold, None, None,
+    );
+    let tac = TacBuilder::new()
+        .n_iter(tac_n_iter)
+        .verbose(false)
+        .max_sample_size(max_sample_size)
+        .alloc_params(TacAllocParams {
+            micro_threshold: resolved.micro_threshold,
+            small_threshold: resolved.small_threshold,
+            hard_floor: resolved.hard_floor,
+            min_pts_per_centroid: resolved.min_pts_per_centroid,
+        })
+        .build();
+    let dim = dataset.encoder().input_dim();
+    let budget = resolved.total_centroids;
+    let result =
+        py.allow_threads(|| tac.train(dataset.values(), dim, &token_ids_vec, budget));
+
+    let centroids_f32: Vec<f32> = result.centroids.iter().map(|x| x.to_f32()).collect();
+    let cen = ndarray::Array2::from_shape_vec((result.n_centroids, dim), centroids_f32)
+        .map_err(|e| PyRuntimeError::new_err(format!("centroids reshape: {e}")))?;
+    Ok((cen.into_pyarray(py).unbind(), result.assignments.into_pyarray(py).unbind()))
+}
+
+/// Run PGC clustering only; return (centroids, assignments).
+#[pyfunction]
+#[pyo3(signature = (
+    vectors, token_ids, doclens, *,
+    total_centroids = None, pgc_n_iter = 10, pgc_sample_multiplier = 5,
+    pgc_empty_strategy = "resample", pgc_iter_hnsw_m = 16, pgc_iter_ef_construction = 200,
+    pgc_iter_ef_search = 50, pgc_iter_lambda = None, pgc_assign_topm = 1,
+    pgc_assign_temp = 0.1, pgc_seed = 42,
+))]
+#[allow(clippy::too_many_arguments)]
+fn cluster_pgc(
+    py: Python<'_>,
+    vectors: PyReadonlyArray2<'_, u16>,
+    token_ids: PyReadonlyArray1<'_, u32>,
+    doclens: PyReadonlyArray1<'_, i32>,
+    total_centroids: Option<usize>,
+    pgc_n_iter: usize,
+    pgc_sample_multiplier: usize,
+    pgc_empty_strategy: &str,
+    pgc_iter_hnsw_m: usize,
+    pgc_iter_ef_construction: usize,
+    pgc_iter_ef_search: usize,
+    pgc_iter_lambda: Option<f32>,
+    pgc_assign_topm: usize,
+    pgc_assign_temp: f32,
+    pgc_seed: u64,
+) -> PyResult<(Py<PyArray2<f32>>, Py<PyArray1<u32>>)> {
+    let empty_strategy = match pgc_empty_strategy {
+        "resample" => EmptyAnchorStrategy::Resample,
+        "remove" => EmptyAnchorStrategy::Remove,
+        "split" => EmptyAnchorStrategy::Split,
+        other => {
+            return Err(PyValueError::new_err(format!(
+                "pgc_empty_strategy must be \"resample\", \"remove\", or \"split\", got {:?}",
+                other
+            )));
+        }
+    };
+    let (dataset, _token_ids_vec) = dataset_from_arrays(&vectors, &token_ids, &doclens)?;
+    let ids_u32 = token_ids
+        .as_slice()
+        .map_err(|_| PyValueError::new_err("token_ids must be C-contiguous"))?;
+    let resolved = resolve_tac_params(ids_u32, total_centroids, None, None, None, None);
+    let pgc = PgcBuilder::new()
+        .n_iter(pgc_n_iter)
+        .sample_multiplier(pgc_sample_multiplier)
+        .empty_strategy(empty_strategy)
+        .iter_hnsw_m(pgc_iter_hnsw_m)
+        .iter_ef_construction(pgc_iter_ef_construction)
+        .iter_ef_search(pgc_iter_ef_search)
+        .iter_lambda(pgc_iter_lambda)
+        .assign_topm(pgc_assign_topm)
+        .assign_temp(pgc_assign_temp)
+        .seed(pgc_seed)
+        .verbose(false)
+        .build();
+    let dim = dataset.encoder().input_dim();
+    let n_tokens = dataset.values().len() / dim;
+    let n_req = resolved.total_centroids.min(n_tokens);
+
+    let result = py.allow_threads(|| pgc.cluster(dataset.values(), dim, n_req));
+
+    let centroids_f32: Vec<f32> = result.centroids.iter().map(|x| x.to_f32()).collect();
+    let cen = ndarray::Array2::from_shape_vec((result.n_centroids, result.dim), centroids_f32)
+        .map_err(|e| PyRuntimeError::new_err(format!("centroids reshape: {e}")))?;
+    let asgn: Vec<u32> = result.assignments.iter().map(|&x| x as u32).collect();
+    Ok((cen.into_pyarray(py).unbind(), asgn.into_pyarray(py).unbind()))
+}
+
+// ============================================================================
 // Module
 // ============================================================================
 
@@ -203,6 +511,10 @@ fn tachiom(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyTachiom>()?;
     m.add_class::<PyTac>()?;
     m.add_function(wrap_pyfunction!(auto_build_params, m)?)?;
+    m.add_function(wrap_pyfunction!(time_tac_clustering, m)?)?;
+    m.add_function(wrap_pyfunction!(time_pgc_clustering, m)?)?;
+    m.add_function(wrap_pyfunction!(cluster_tac, m)?)?;
+    m.add_function(wrap_pyfunction!(cluster_pgc, m)?)?;
     Ok(())
 }
 
@@ -210,9 +522,70 @@ fn tachiom(m: &Bound<'_, PyModule>) -> PyResult<()> {
 // PyTachiom class
 // ============================================================================
 
+/// Runtime dispatch over the compiled PQ-subspace variants.  `M` is a const
+/// generic (compile-time) for speed, so we hold one monomorphized `Tachiom<M>`
+/// per supported `pq_subspaces` value and dispatch at runtime.
+enum TachiomInner {
+    M4(Tachiom<4>),
+    M8(Tachiom<8>),
+    M16(Tachiom<16>),
+    M32(Tachiom<32>),
+    M64(Tachiom<64>),
+    M128(Tachiom<128>),
+}
+
+/// Run `$body` against the inner `Tachiom<M>` regardless of which variant it is.
+macro_rules! with_inner {
+    ($self:expr, $t:ident => $body:expr) => {
+        match &$self.inner {
+            TachiomInner::M4($t) => $body,
+            TachiomInner::M8($t) => $body,
+            TachiomInner::M16($t) => $body,
+            TachiomInner::M32($t) => $body,
+            TachiomInner::M64($t) => $body,
+            TachiomInner::M128($t) => $body,
+        }
+    };
+}
+
+/// Dispatch a build call `$f::<M>($args...)` to the `TachiomInner` variant for the
+/// runtime `pq_subspaces` value.  `$f` is a generic free fn over `const M: usize`.
+/// `pq_subspaces` must be pre-validated to one of these (see `warn_pq_subspaces`).
+macro_rules! dispatch_pq {
+    ($pq:expr, $f:ident ( $($arg:expr),* $(,)? )) => {
+        match $pq {
+            4 => TachiomInner::M4($f::<4>($($arg),*)),
+            8 => TachiomInner::M8($f::<8>($($arg),*)),
+            16 => TachiomInner::M16($f::<16>($($arg),*)),
+            32 => TachiomInner::M32($f::<32>($($arg),*)),
+            64 => TachiomInner::M64($f::<64>($($arg),*)),
+            128 => TachiomInner::M128($f::<128>($($arg),*)),
+            _ => unreachable!("pq_subspaces validated by warn_pq_subspaces"),
+        }
+    };
+}
+
+/// Generic build helpers so `dispatch_pq!` can pick `M` at runtime.
+fn build_index_m<const M: usize>(
+    dataset: TachiomInputDataset,
+    params: &TachiomBuildParams,
+) -> Tachiom<M> {
+    Tachiom::<M>::build_index(dataset, params)
+}
+
+fn build_from_tac_m<const M: usize>(
+    centroids: Vec<f16>,
+    n_centroids: usize,
+    assignments: Vec<usize>,
+    dataset: TachiomInputDataset,
+    params: &TachiomBuildParams,
+) -> Tachiom<M> {
+    Tachiom::<M>::build_index_from_tac(centroids, n_centroids, assignments, dataset, params)
+}
+
 #[pyclass(name = "Tachiom", module = "tachiom", unsendable)]
 pub struct PyTachiom {
-    inner: Tachiom<M_FIXED>,
+    inner: TachiomInner,
 }
 
 #[pymethods]
@@ -306,7 +679,7 @@ impl PyTachiom {
             center_dataset,
         };
 
-        let inner = py.allow_threads(|| Tachiom::<M_FIXED>::build_index(dataset, &params));
+        let inner = py.allow_threads(|| dispatch_pq!(pq_subspaces, build_index_m(dataset, &params)));
         Ok(PyTachiom { inner })
     }
 
@@ -405,7 +778,7 @@ impl PyTachiom {
             center_dataset,
         };
 
-        let inner = py.allow_threads(|| Tachiom::<M_FIXED>::build_index(dataset, &params));
+        let inner = py.allow_threads(|| dispatch_pq!(pq_subspaces, build_index_m(dataset, &params)));
         Ok(PyTachiom { inner })
     }
 
@@ -427,6 +800,9 @@ impl PyTachiom {
         pgc_iter_hnsw_m = 16,
         pgc_iter_ef_construction = 200,
         pgc_iter_ef_search = 50,
+        pgc_iter_lambda = None,
+        pgc_assign_topm = 1,
+        pgc_assign_temp = 0.1,
         pgc_seed = 42,
         pq_sample_size = None,
         pq_n_iter = None,
@@ -450,6 +826,9 @@ impl PyTachiom {
         pgc_iter_hnsw_m: usize,
         pgc_iter_ef_construction: usize,
         pgc_iter_ef_search: usize,
+        pgc_iter_lambda: Option<f32>,
+        pgc_assign_topm: usize,
+        pgc_assign_temp: f32,
         pgc_seed: u64,
         pq_sample_size: Option<usize>,
         pq_n_iter: Option<usize>,
@@ -495,6 +874,9 @@ impl PyTachiom {
             .iter_hnsw_m(pgc_iter_hnsw_m)
             .iter_ef_construction(pgc_iter_ef_construction)
             .iter_ef_search(pgc_iter_ef_search)
+            .iter_lambda(pgc_iter_lambda)
+            .assign_topm(pgc_assign_topm)
+            .assign_temp(pgc_assign_temp)
             .seed(pgc_seed)
             .verbose(true)
             .build();
@@ -523,14 +905,106 @@ impl PyTachiom {
             // Borrow dataset.values() for PGC; the borrow ends when cluster() returns,
             // so dataset can then be moved into build_index_from_tac without a clone.
             let pgc_result = pgc.cluster(dataset.values(), dim, n_req);
+            let (c, nc, a) = (pgc_result.centroids, pgc_result.n_centroids, pgc_result.assignments);
+            dispatch_pq!(pq_subspaces, build_from_tac_m(c, nc, a, dataset, &params))
+        });
+        Ok(PyTachiom { inner })
+    }
 
-            Tachiom::<M_FIXED>::build_index_from_tac(
-                pgc_result.centroids,
-                pgc_result.n_centroids,
-                pgc_result.assignments,
-                dataset,
-                &params,
-            )
+    /// Build a Tachiom index from in-memory arrays using EXTERNALLY-computed
+    /// coarse centroids and per-token assignments (e.g. from GPU k-means).
+    ///
+    /// Decouples clustering from indexing: the caller supplies `centroids`
+    /// (`[K, dim]` f32) and `assignments` (`[n_tokens]` u32, token i -> centroid),
+    /// and this runs the identical downstream (PQ -> HNSW -> IVF) as
+    /// `build_with_pgc` / `build_from_arrays`.  Accepts the same flat shard
+    /// buffers the Python loader already produces, so no corpus concatenation
+    /// to disk is needed.  `center_dataset` is false (caller owns preprocessing).
+    #[classmethod]
+    #[pyo3(signature = (
+        vectors,
+        token_ids,
+        doclens,
+        centroids,
+        assignments,
+        *,
+        pq_sample_size = None,
+        pq_n_iter = None,
+        normalize = None,
+        pq_seed = None,
+        hnsw_m = None,
+        ef_construction = None,
+        pq_subspaces = 32,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn build_from_arrays_with_centroids(
+        _cls: &Bound<'_, PyType>,
+        py: Python<'_>,
+        vectors: PyReadonlyArray2<'_, u16>,
+        token_ids: PyReadonlyArray1<'_, u32>,
+        doclens: PyReadonlyArray1<'_, i32>,
+        centroids: PyReadonlyArray2<'_, f32>,
+        assignments: PyReadonlyArray1<'_, u32>,
+        pq_sample_size: Option<usize>,
+        pq_n_iter: Option<usize>,
+        normalize: Option<bool>,
+        pq_seed: Option<u64>,
+        hnsw_m: Option<usize>,
+        ef_construction: Option<usize>,
+        pq_subspaces: usize,
+    ) -> PyResult<Self> {
+        warn_pq_subspaces(py, pq_subspaces)?;
+        let pq_sample_size = pq_sample_size.unwrap_or(10_000_000);
+        let pq_n_iter = pq_n_iter.unwrap_or(10);
+        let normalize = normalize.unwrap_or(true);
+        let pq_seed = pq_seed.unwrap_or(42);
+        let hnsw_m = hnsw_m.unwrap_or(32);
+        let ef_construction = ef_construction.unwrap_or(1500);
+
+        let (dataset, token_ids_vec) = dataset_from_arrays(&vectors, &token_ids, &doclens)?;
+        let n_tokens = token_ids_vec.len();
+
+        let cshape = centroids.shape();
+        if cshape.len() != 2 {
+            return Err(PyValueError::new_err("centroids must be a 2D array [K, dim]"));
+        }
+        let n_centroids = cshape[0];
+        let centroids_f16: Vec<f16> = centroids
+            .as_slice()
+            .map_err(|_| PyValueError::new_err("centroids must be C-contiguous"))?
+            .iter()
+            .map(|&x| f16::from_f32(x))
+            .collect();
+
+        let asgn_slice = assignments
+            .as_slice()
+            .map_err(|_| PyValueError::new_err("assignments must be C-contiguous"))?;
+        if asgn_slice.len() != n_tokens {
+            return Err(PyValueError::new_err(format!(
+                "assignments length ({}) != n_tokens ({})",
+                asgn_slice.len(),
+                n_tokens
+            )));
+        }
+        let assignments_usize: Vec<usize> = asgn_slice.iter().map(|&x| x as usize).collect();
+
+        let params = TachiomBuildParams {
+            token_ids: token_ids_vec,
+            total_centroids: n_centroids,
+            tac_n_iter: 0,
+            tac_alloc_params: Default::default(),
+            pq_sample_size,
+            pq_n_iter,
+            normalize,
+            pq_seed: Some(pq_seed),
+            hnsw_params: HNSWBuildConfiguration::default()
+                .with_num_neighbors(hnsw_m)
+                .with_ef_construction(ef_construction),
+            center_dataset: false,
+        };
+
+        let inner = py.allow_threads(|| {
+            dispatch_pq!(pq_subspaces, build_from_tac_m(centroids_f16, n_centroids, assignments_usize, dataset, &params))
         });
         Ok(PyTachiom { inner })
     }
@@ -602,23 +1076,29 @@ impl PyTachiom {
         };
 
         let inner = py.allow_threads(|| {
-            Tachiom::<M_FIXED>::build_index_from_tac(
-                centroids_f16,
-                n_centroids,
-                assignments,
-                dataset,
-                &params,
-            )
+            dispatch_pq!(pq_subspaces, build_from_tac_m(centroids_f16, n_centroids, assignments, dataset, &params))
         });
         Ok(PyTachiom { inner })
     }
 
     /// Load a previously-saved Tachiom index from disk.
+    ///
+    /// `pq_subspaces` must match the M the index was built with (the on-disk PQ
+    /// format is M-specific); the caller is responsible for tracking it.
     #[classmethod]
-    fn load(_cls: &Bound<'_, PyType>, py: Python<'_>, path: &str) -> PyResult<Self> {
+    #[pyo3(signature = (path, *, pq_subspaces = 32))]
+    fn load(_cls: &Bound<'_, PyType>, py: Python<'_>, path: &str, pq_subspaces: usize) -> PyResult<Self> {
+        warn_pq_subspaces(py, pq_subspaces)?;
         let path_owned = path.to_owned();
         let inner = py
-            .allow_threads(|| Tachiom::<M_FIXED>::load_index(&path_owned))
+            .allow_threads(|| match pq_subspaces {
+                4 => Tachiom::<4>::load_index(&path_owned).map(TachiomInner::M4),
+                8 => Tachiom::<8>::load_index(&path_owned).map(TachiomInner::M8),
+                16 => Tachiom::<16>::load_index(&path_owned).map(TachiomInner::M16),
+                64 => Tachiom::<64>::load_index(&path_owned).map(TachiomInner::M64),
+                128 => Tachiom::<128>::load_index(&path_owned).map(TachiomInner::M128),
+                _ => Tachiom::<32>::load_index(&path_owned).map(TachiomInner::M32),
+            })
             .map_err(|e| PyIOError::new_err(format!("Failed to load index: {e:?}")))?;
         Ok(PyTachiom { inner })
     }
@@ -628,7 +1108,7 @@ impl PyTachiom {
     /// Save the index to disk (bincode-flavoured serialization).
     fn save(&self, py: Python<'_>, path: &str) -> PyResult<()> {
         let path_owned = path.to_owned();
-        py.allow_threads(|| self.inner.save_index(&path_owned))
+        py.allow_threads(|| with_inner!(self, t => t.save_index(&path_owned)))
             .map_err(|e| PyIOError::new_err(format!("Failed to save index: {e:?}")))?;
         Ok(())
     }
@@ -663,12 +1143,12 @@ impl PyTachiom {
         lambda_: Option<f32>,
     ) -> PyResult<(Py<PyArray1<f32>>, Py<PyArray1<u32>>)> {
         let ef_search = ef_search.unwrap_or_else(|| ((k_centroids as f64) * 1.5).round() as usize);
-        let dim = self.inner.residuals.encoder().input_dim();
+        let dim = with_inner!(self, t => t.residuals.encoder().input_dim());
         let q_slice = require_contiguous_2d(&query, dim, "query")?;
         let q_view = DenseMultiVectorView::new(q_slice, dim);
 
         let result: Vec<(f32, u32)> = py.allow_threads(|| {
-            self.inner.search(
+            with_inner!(self, t => t.search(
                 q_view,
                 k,
                 k_centroids,
@@ -677,7 +1157,7 @@ impl PyTachiom {
                 alpha,
                 beta,
                 lambda_,
-            )
+            ))
         });
 
         let (scores, doc_ids) = pad_result(result, k);
@@ -736,7 +1216,7 @@ impl PyTachiom {
         lambda_: Option<f32>,
     ) -> PyResult<(Py<PyArray2<f32>>, Py<PyArray2<u32>>)> {
         let ef_search = ef_search.unwrap_or_else(|| ((k_centroids as f64) * 1.5).round() as usize);
-        let dim = self.inner.residuals.encoder().input_dim();
+        let dim = with_inner!(self, t => t.residuals.encoder().input_dim());
 
         let tokens_shape = tokens.shape();
         if tokens_shape.len() != 2 || tokens_shape[1] != dim {
@@ -812,7 +1292,7 @@ impl PyTachiom {
         };
 
         let results: Vec<Vec<(f32, u32)>> = py.allow_threads(|| {
-            self.inner.batch_search(
+            with_inner!(self, t => t.batch_search(
                 &views,
                 k,
                 k_centroids,
@@ -822,7 +1302,7 @@ impl PyTachiom {
                 beta,
                 lambda_,
                 num_threads,
-            )
+            ))
         });
 
         let (scores_arr, doc_ids_arr) = pad_results_batch(results, n_queries, k);
@@ -837,39 +1317,36 @@ impl PyTachiom {
     /// Number of indexed documents.
     #[getter]
     fn len(&self) -> usize {
-        self.inner.n_elements()
+        with_inner!(self, t => t.n_elements())
     }
 
     /// Token vector dimensionality (before quantization).
     #[getter]
     fn dim(&self) -> usize {
-        self.inner.dim()
+        with_inner!(self, t => t.dim())
     }
 
     /// Total number of tokens across all documents.
     #[getter]
     fn n_tokens(&self) -> usize {
-        let dim = self.inner.residuals.encoder().output_dim();
-        if dim == 0 {
-            return 0;
-        }
-        self.inner
-            .residuals
-            .offsets()
-            .last()
-            .map(|&end| end / dim)
-            .unwrap_or(0)
+        with_inner!(self, t => {
+            let dim = t.residuals.encoder().output_dim();
+            if dim == 0 {
+                return 0;
+            }
+            t.residuals.offsets().last().map(|&end| end / dim).unwrap_or(0)
+        })
     }
 
     /// Number of coarse centroids in the IVF.
     #[getter]
     fn n_centroids(&self) -> usize {
-        self.inner.centroids.n_elements()
+        with_inner!(self, t => t.centroids.n_elements())
     }
 
     /// Print a per-component size breakdown of the index.
     fn print_space_usage(&self) {
-        let (ch, il, off, res) = self.inner.space_usage_components();
+        let (ch, il, off, res) = with_inner!(self, t => t.space_usage_components());
         let total = ch + il + off + res;
         let gb = |b: usize| b as f64 / 1_073_741_824.0;
         let pct = |b: usize| 100.0 * b as f64 / total as f64;
@@ -914,25 +1391,28 @@ impl PyTachiom {
         py: Python<'py>,
         doc_id: u32,
     ) -> PyResult<Py<PyArray2<f32>>> {
-        let n_docs = self.inner.residuals.len();
-        if doc_id as usize >= n_docs {
-            return Err(PyValueError::new_err(format!(
-                "doc_id {doc_id} is out of range (index has {n_docs} documents)"
-            )));
-        }
-        let encoded = self.inner.residuals.get(doc_id as u64);
-        let decoded = self.inner.residuals.encoder().decode_vector(encoded);
-        let n_tokens = decoded.num_vecs();
-        let dim = decoded.dim();
-        let mut array = ndarray::Array2::from_shape_vec((n_tokens, dim), decoded.values().to_vec())
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        if let Some(mean) = &self.inner.dataset_mean {
-            for mut row in array.rows_mut() {
-                for (v, &m) in row.iter_mut().zip(mean.iter()) {
-                    *v += m;
+        let array = with_inner!(self, t => {
+            let n_docs = t.residuals.len();
+            if doc_id as usize >= n_docs {
+                return Err(PyValueError::new_err(format!(
+                    "doc_id {doc_id} is out of range (index has {n_docs} documents)"
+                )));
+            }
+            let encoded = t.residuals.get(doc_id as u64);
+            let decoded = t.residuals.encoder().decode_vector(encoded);
+            let n_tokens = decoded.num_vecs();
+            let dim = decoded.dim();
+            let mut array = ndarray::Array2::from_shape_vec((n_tokens, dim), decoded.values().to_vec())
+                .map_err(|e| PyValueError::new_err(e.to_string()))?;
+            if let Some(mean) = &t.dataset_mean {
+                for mut row in array.rows_mut() {
+                    for (v, &m) in row.iter_mut().zip(mean.iter()) {
+                        *v += m;
+                    }
                 }
             }
-        }
+            array
+        });
         Ok(array.into_pyarray(py).unbind())
     }
 
@@ -1014,21 +1494,25 @@ impl PyTac {
                 None,
                 self.micro_threshold,
                 self.small_threshold,
+                None,
+                None,
             )
             .total_centroids
         });
 
-        let mut tac_builder = TacBuilder::new()
-            .n_iter(self.n_iter)
-            .verbose(self.verbose)
-            .max_sample_size(self.max_sample_size);
+        let mut alloc_params = TacAllocParams::default();
         if let Some(v) = self.micro_threshold {
-            tac_builder = tac_builder.micro_threshold(v);
+            alloc_params.micro_threshold = v;
         }
         if let Some(v) = self.small_threshold {
-            tac_builder = tac_builder.small_threshold(v);
+            alloc_params.small_threshold = v;
         }
-        let tac = tac_builder.build();
+        let tac = TacBuilder::new()
+            .n_iter(self.n_iter)
+            .verbose(self.verbose)
+            .max_sample_size(self.max_sample_size)
+            .alloc_params(alloc_params)
+            .build();
 
         let result = py.allow_threads(|| tac.train(&flat_f16, dim, &token_ids, budget));
         self.result = Some(result);
@@ -1100,14 +1584,19 @@ fn warn_saturation_cap(py: Python<'_>, requested: usize, sat_cap: usize) -> PyRe
     Ok(())
 }
 
-fn warn_pq_subspaces(py: Python<'_>, pq_subspaces: usize) -> PyResult<()> {
-    if pq_subspaces != M_FIXED {
-        let msg = format!(
-            "pq_subspaces={pq_subspaces} requested but only M={M_FIXED} is supported in this build; \
-             proceeding with M={M_FIXED}.  Results will reflect M={M_FIXED}, not M={pq_subspaces}."
-        );
-        let warnings = py.import("warnings")?;
-        warnings.call_method1("warn", (msg,))?;
+/// Validate that `pq_subspaces` is one of the compiled variants ({32, 64}).
+fn warn_pq_subspaces(_py: Python<'_>, pq_subspaces: usize) -> PyResult<()> {
+    // M is a compile-time const generic, so only pre-compiled variants are
+    // selectable.  These cover every permissible M for dim=128 (M | dim, M % 4 == 0).
+    // The build itself asserts M | token_dim, so an M valid here but not for the
+    // actual dim fails at build with a clear panic.  Quality is up to the caller;
+    // this only gates on what's compiled.
+    const COMPILED_M: [usize; 6] = [4, 8, 16, 32, 64, 128];
+    if !COMPILED_M.contains(&pq_subspaces) {
+        return Err(PyValueError::new_err(format!(
+            "pq_subspaces={pq_subspaces} has no compiled variant; available: {COMPILED_M:?}. \
+             (Add a TachiomInner variant + dispatch_pq arm and recompile to support more.)"
+        )));
     }
     Ok(())
 }

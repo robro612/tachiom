@@ -13,10 +13,13 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use crate::graph::Graph;
-use crate::hnsw::{HNSW, HNSWBuildConfiguration, HNSWSearchConfiguration};
+use crate::hnsw::{
+    EarlyTerminationStrategy, HNSW, HNSWBuildConfiguration, HNSWSearchConfiguration,
+};
 use vectorium::core::index::Index;
 use vectorium::core::vector::DenseVectorView;
 use vectorium::distances::DotProduct;
+use vectorium::Distance;
 use vectorium::{DenseDataset, PlainDenseQuantizer};
 
 type AnchorDataset = DenseDataset<PlainDenseQuantizer<f16, DotProduct>>;
@@ -62,6 +65,9 @@ pub struct PgcBuilder {
     iter_hnsw_m: usize,
     iter_ef_construction: usize,
     iter_ef_search: usize,
+    iter_lambda: Option<f32>,
+    assign_topm: usize,
+    assign_temp: f32,
     seed: u64,
     verbose: bool,
 }
@@ -75,6 +81,9 @@ impl Default for PgcBuilder {
             iter_hnsw_m: 16,
             iter_ef_construction: 200,
             iter_ef_search: 50,
+            iter_lambda: None,
+            assign_topm: 1,
+            assign_temp: 0.1,
             seed: 42,
             verbose: false,
         }
@@ -117,6 +126,30 @@ impl PgcBuilder {
         self
     }
 
+    /// Early-termination relaxation for the per-iteration nearest-anchor search.
+    /// `None` (or `Some(0.0)`) disables it; typical useful range is `[0.01, 0.2]`.
+    /// Must be tuned together with `iter_ef_search`.
+    pub fn iter_lambda(mut self, iter_lambda: Option<f32>) -> Self {
+        self.iter_lambda = iter_lambda;
+        self
+    }
+
+    /// Number of nearest anchors used for the soft centroid update (top-m local
+    /// soft assignment).  `1` = hard top-1 (default, exact previous behaviour).
+    /// Indexing/final assignment stays hard top-1 regardless.
+    pub fn assign_topm(mut self, assign_topm: usize) -> Self {
+        self.assign_topm = assign_topm.max(1);
+        self
+    }
+
+    /// Softmax temperature for the top-m membership weights `wᵢ ∝ exp(sᵢ/τ)`.
+    /// Smaller → peaked toward top-1; larger → uniform over the m (homogenizes).
+    /// Ignored when `assign_topm == 1`.
+    pub fn assign_temp(mut self, assign_temp: f32) -> Self {
+        self.assign_temp = assign_temp;
+        self
+    }
+
     pub fn seed(mut self, seed: u64) -> Self {
         self.seed = seed;
         self
@@ -135,6 +168,9 @@ impl PgcBuilder {
             iter_hnsw_m: self.iter_hnsw_m,
             iter_ef_construction: self.iter_ef_construction,
             iter_ef_search: self.iter_ef_search,
+            iter_lambda: self.iter_lambda,
+            assign_topm: self.assign_topm,
+            assign_temp: self.assign_temp,
             seed: self.seed,
             verbose: self.verbose,
         }
@@ -152,6 +188,9 @@ pub struct ProximityGraphClustering {
     iter_hnsw_m: usize,
     iter_ef_construction: usize,
     iter_ef_search: usize,
+    iter_lambda: Option<f32>,
+    assign_topm: usize,
+    assign_temp: f32,
     seed: u64,
     verbose: bool,
 }
@@ -207,7 +246,13 @@ impl ProximityGraphClustering {
         }
         let mut n_active = n_centroids;
 
-        let search_config = HNSWSearchConfiguration::default().with_ef_search(self.iter_ef_search);
+        let early_termination = match self.iter_lambda {
+            Some(l) if l > 0.0 => EarlyTerminationStrategy::DistanceAdaptive { lambda: l },
+            _ => EarlyTerminationStrategy::None,
+        };
+        let search_config = HNSWSearchConfiguration::default()
+            .with_ef_search(self.iter_ef_search)
+            .with_early_termination(early_termination);
 
         // ── Step 2: Iterative refinement ──────────────────────────────────────
         for iter in 0..self.n_iter {
@@ -239,47 +284,97 @@ impl ProximityGraphClustering {
                 (0..sample_n).map(|_| rng.gen_range(0..n_vectors)).collect()
             };
 
-            // Parallel: assign each sampled vector to its nearest anchor.
-            let iter_assignments: Vec<usize> = sampled
+            // Parallel: for each sampled vector, retrieve its top-m anchors and
+            // turn their similarities into softmax membership weights.  Stored
+            // flat as `topm` (anchor, weight) records per vector, best-first
+            // (padded with weight 0 when the graph returns fewer than topm hits).
+            // topm=1 reduces exactly to hard top-1 (single weight = 1.0).
+            let topm = self.assign_topm.max(1);
+            let temp = self.assign_temp.max(1e-6);
+            let records: Vec<(u32, f32)> = sampled
                 .par_iter()
-                .map(|&vidx| {
+                .flat_map_iter(|&vidx| {
                     let q: Vec<f32> = data[vidx * dim..(vidx + 1) * dim]
                         .iter()
                         .map(|x| x.to_f32())
                         .collect();
-                    let hits = hnsw.search(DenseVectorView::new(&q), 1, &search_config);
-                    if hits.is_empty() {
-                        0
-                    } else {
-                        hits[0].vector as usize
+                    let hits = hnsw.search(DenseVectorView::new(&q), topm, &search_config);
+                    let mut out: Vec<(u32, f32)> = Vec::with_capacity(topm);
+                    if !hits.is_empty() {
+                        // softmax over dot-product similarities (higher = nearer)
+                        let smax = hits
+                            .iter()
+                            .map(|h| h.distance.distance())
+                            .fold(f32::MIN, f32::max);
+                        let exps: Vec<f32> = hits
+                            .iter()
+                            .map(|h| ((h.distance.distance() - smax) / temp).exp())
+                            .collect();
+                        let z = exps.iter().sum::<f32>().max(1e-12);
+                        for (h, &e) in hits.iter().zip(exps.iter()) {
+                            out.push((h.vector as u32, e / z));
+                        }
                     }
+                    while out.len() < topm {
+                        out.push((0u32, 0.0));
+                    }
+                    out.into_iter()
                 })
                 .collect();
 
-            // Serial: accumulate sum vectors and counts per anchor.
+            // Parallel scatter-add reduction with soft weights: per-thread private
+            // (sums, weights) accumulators over disjoint vector ranges, then reduce.
+            // Deterministic for a fixed thread count (FP reassociation aside).
+            const EMPTY_EPS: f32 = 1e-9;
+            let n_chunks = rayon::current_num_threads().max(1);
+            let vec_chunk = sampled.len().div_ceil(n_chunks).max(1);
+            let partials: Vec<(Vec<f32>, Vec<f32>)> = (0..sampled.len())
+                .into_par_iter()
+                .chunks(vec_chunk)
+                .map(|vrange| {
+                    let mut sums = vec![0.0f32; n_active * dim];
+                    let mut weights = vec![0.0f32; n_active];
+                    for v in vrange {
+                        let vidx = sampled[v];
+                        let src = &data[vidx * dim..(vidx + 1) * dim];
+                        for j in 0..topm {
+                            let (anchor, w) = records[v * topm + j];
+                            if w <= 0.0 {
+                                continue;
+                            }
+                            let a = (anchor as usize).min(n_active - 1); // clamp approximate hits
+                            weights[a] += w;
+                            let dst = &mut sums[a * dim..(a + 1) * dim];
+                            for (d, s) in dst.iter_mut().zip(src.iter()) {
+                                *d += s.to_f32() * w;
+                            }
+                        }
+                    }
+                    (sums, weights)
+                })
+                .collect();
+
+            // Reduce partials in parallel over disjoint output ranges.
             let mut sums = vec![0.0f32; n_active * dim];
-            let mut counts = vec![0usize; n_active];
-            for (&vidx, &anchor_idx) in sampled.iter().zip(iter_assignments.iter()) {
-                let a = anchor_idx.min(n_active - 1); // clamp to guard against HNSW approximate hits
-                counts[a] += 1;
-                let src = &data[vidx * dim..(vidx + 1) * dim];
-                let dst = &mut sums[a * dim..(a + 1) * dim];
-                for (d, s) in dst.iter_mut().zip(src.iter()) {
-                    *d += s.to_f32();
-                }
-            }
+            let mut weights = vec![0.0f32; n_active];
+            sums.par_iter_mut().enumerate().for_each(|(i, dst)| {
+                *dst = partials.iter().map(|(s, _)| s[i]).sum();
+            });
+            weights.par_iter_mut().enumerate().for_each(|(a, dst)| {
+                *dst = partials.iter().map(|(_, w)| w[a]).sum();
+            });
 
-            let n_empty = counts.iter().filter(|&&c| c == 0).count();
+            let n_empty = weights.iter().filter(|&&w| w < EMPTY_EPS).count();
 
-            // Update anchors based on means + empty-anchor strategy.
+            // Update anchors based on soft means + empty-anchor strategy.
             match self.empty_strategy {
                 EmptyAnchorStrategy::Resample => {
                     // Keep n_active unchanged; resample empty anchors.
                     for a in 0..n_active {
-                        if counts[a] > 0 {
+                        if weights[a] > EMPTY_EPS {
                             let mut mean: Vec<f32> = sums[a * dim..(a + 1) * dim]
                                 .iter()
-                                .map(|&x| x / counts[a] as f32)
+                                .map(|&x| x / weights[a])
                                 .collect();
                             l2_normalize_f32(&mut mean);
                             for (j, &v) in mean.iter().enumerate() {
@@ -293,13 +388,13 @@ impl ProximityGraphClustering {
                     }
                 }
                 EmptyAnchorStrategy::Remove => {
-                    // Compact anchors: keep only those with at least one assignment.
+                    // Compact anchors: keep only those with non-zero weight.
                     let mut new_anchors: Vec<f16> = Vec::with_capacity(n_active * dim);
                     for a in 0..n_active {
-                        if counts[a] > 0 {
+                        if weights[a] > EMPTY_EPS {
                             let mut mean: Vec<f32> = sums[a * dim..(a + 1) * dim]
                                 .iter()
-                                .map(|&x| x / counts[a] as f32)
+                                .map(|&x| x / weights[a])
                                 .collect();
                             l2_normalize_f32(&mut mean);
                             for &v in &mean {
@@ -311,32 +406,25 @@ impl ProximityGraphClustering {
                     anchors = new_anchors;
                 }
                 EmptyAnchorStrategy::Split => {
-                    // Find the most-populated anchor.
-                    let max_anchor = counts
+                    // Most-populated anchor by total soft weight.
+                    let max_anchor = weights
                         .iter()
                         .enumerate()
-                        .max_by_key(|&(_, &c)| c)
+                        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
                         .map(|(i, _)| i)
                         .unwrap_or(0);
 
-                    // Collect the sampled vector indices assigned to that anchor.
-                    let max_members: Vec<usize> = sampled
-                        .iter()
-                        .zip(iter_assignments.iter())
-                        .filter_map(|(&vidx, &aidx)| {
-                            if aidx.min(n_active - 1) == max_anchor {
-                                Some(vidx)
-                            } else {
-                                None
-                            }
-                        })
+                    // Members = sampled vectors whose hard top-1 (best-first hit) is max_anchor.
+                    let max_members: Vec<usize> = (0..sampled.len())
+                        .filter(|&v| (records[v * topm].0 as usize).min(n_active - 1) == max_anchor)
+                        .map(|v| sampled[v])
                         .collect();
 
                     for a in 0..n_active {
-                        if counts[a] > 0 {
+                        if weights[a] > EMPTY_EPS {
                             let mut mean: Vec<f32> = sums[a * dim..(a + 1) * dim]
                                 .iter()
-                                .map(|&x| x / counts[a] as f32)
+                                .map(|&x| x / weights[a])
                                 .collect();
                             l2_normalize_f32(&mut mean);
                             for (j, &v) in mean.iter().enumerate() {

@@ -214,6 +214,7 @@ impl<const M: usize> Tachiom<M> {
         // then allocate pq_sample_size tokens using the largest-remainder method so
         // the total is exact.
         println!("[Tachiom::build_index] Step 2: Selecting PQ training sample...");
+        let t_pq_sample = std::time::Instant::now();
         let (pq_train_flat, pq_train_assignments) = {
             use rand::SeedableRng;
             use rand::rngs::StdRng;
@@ -344,9 +345,14 @@ impl<const M: usize> Tachiom<M> {
             "[Tachiom::build_index] PQ training sample: {} tokens",
             pq_train_flat.len() / token_dim
         );
+        println!(
+            "[Tachiom::build_index] TIMING pq_sample_selection: {:.3}s",
+            t_pq_sample.elapsed().as_secs_f64()
+        );
 
         // ── Step 3: Build centroid dataset and train encoder ──────────────────
         println!("[Tachiom::build_index] Step 3: Training encoder...");
+        let t_pq_train = std::time::Instant::now();
 
         let centroids_f32: Vec<f32> = centroids_f16.iter().map(|x| x.to_f32()).collect();
 
@@ -367,8 +373,13 @@ impl<const M: usize> Tachiom<M> {
             params.normalize,
             params.pq_seed,
         );
+        println!(
+            "[Tachiom::build_index] TIMING pq_encoder_train: {:.3}s",
+            t_pq_train.elapsed().as_secs_f64()
+        );
 
         // ── Step 4: Encode all documents ──────────────────────────────────────
+        let t_encode = std::time::Instant::now();
         // Use push_encoded_with_ids to bypass search_nearest over ncoarse centroids —
         // with millions of centroids a brute-force search per token is infeasible.
         // Instead we use the TAC assignments computed in Step 1 as direct lookups.
@@ -428,21 +439,37 @@ impl<const M: usize> Tachiom<M> {
             )
         };
 
+        println!(
+            "[Tachiom::build_index] TIMING doc_encoding: {:.3}s",
+            t_encode.elapsed().as_secs_f64()
+        );
+
         // ── Step 5: Build HNSW on coarse centroids ────────────────────────────
         println!(
             "[Tachiom::build_index] Step 4: Building HNSW on {} centroids...",
             n_centroids
         );
+        let t_hnsw = std::time::Instant::now();
         let centroid_dataset: CentroidDataset = DenseDataset::from_raw(
             centroids_f16.into_boxed_slice(),
             n_centroids,
             PlainDenseQuantizer::<f16, DotProduct>::new(token_dim),
         );
         let centroids_hnsw = HNSWCentroids::build_index(centroid_dataset, &params.hnsw_params);
+        println!(
+            "[Tachiom::build_index] TIMING hnsw_build: {:.3}s",
+            t_hnsw.elapsed().as_secs_f64()
+        );
 
         // ── Step 6: Build inverted lists ──────────────────────────────────────
         println!("[Tachiom::build_index] Step 5: Building inverted lists...");
-        Tachiom::from_parts(centroids_hnsw, &assignments_usize, residuals)
+        let t_ivf = std::time::Instant::now();
+        let tachiom = Tachiom::from_parts(centroids_hnsw, &assignments_usize, residuals);
+        println!(
+            "[Tachiom::build_index] TIMING inverted_lists: {:.3}s",
+            t_ivf.elapsed().as_secs_f64()
+        );
+        tachiom
     }
 
     /// Raw byte sizes for each index component: (centroids_hnsw, inverted_lists, offsets, residuals).
@@ -945,6 +972,7 @@ impl<const M: usize> Index<TachiomInputDataset> for Tachiom<M> {
         let (centered_buf, dataset_mean) = if params.center_dataset {
             use rayon::prelude::*;
             println!("[Tachiom::build_index] Computing dataset mean for centering...");
+            let t_center = std::time::Instant::now();
             let mean_f64: Vec<f64> = flat_f16
                 .par_chunks_exact(token_dim)
                 .fold(
@@ -974,6 +1002,10 @@ impl<const M: usize> Index<TachiomInputDataset> for Tachiom<M> {
                         .map(|(&v, &m)| f16::from_f32(v.to_f32() - m))
                 })
                 .collect();
+            println!(
+                "[Tachiom::build_index] TIMING centering: {:.3}s",
+                t_center.elapsed().as_secs_f64()
+            );
             (Some(centered), Some(mean_f32))
         } else {
             (None, None)
@@ -989,6 +1021,7 @@ impl<const M: usize> Index<TachiomInputDataset> for Tachiom<M> {
             n_tokens
         );
         println!("[Tachiom::build_index] Step 1: Token-Aware Clustering...");
+        let t_tac = std::time::Instant::now();
         let tac = TacBuilder::new()
             .n_iter(params.tac_n_iter)
             .alloc_params(params.tac_alloc_params)
@@ -999,6 +1032,10 @@ impl<const M: usize> Index<TachiomInputDataset> for Tachiom<M> {
             token_dim,
             &params.token_ids,
             params.total_centroids,
+        );
+        println!(
+            "[Tachiom::build_index] TIMING tac_clustering: {:.3}s",
+            t_tac.elapsed().as_secs_f64()
         );
         let n_centroids = tac_result.n_centroids;
         let assignments_usize: Vec<usize> =
