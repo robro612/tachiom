@@ -153,20 +153,20 @@ pub fn allocate_centroids_damped_spread(
 
     let n_vectors: usize = token_groups.values().map(|v| v.len()).sum();
 
-    println!("\n=== Damped Spread Centroid Allocation ===");
-    println!("Total vectors: {}", n_vectors);
-    println!("Budget: {} centroids", total_centroids);
-    println!(
+    eprintln!("\n=== Damped Spread Centroid Allocation ===");
+    eprintln!("Total vectors: {}", n_vectors);
+    eprintln!("Budget: {} centroids", total_centroids);
+    eprintln!(
         "Thresholds: Micro < {}, Small < {}",
         micro_threshold, small_threshold
     );
-    println!(
+    eprintln!(
         "Bounds: Floor = {}, Min points/centroid = {}",
         hard_floor, min_pts_per_centroid
     );
 
     // ── Phase 1: Tail handling ────────────────────────────────────────────────
-    println!("\n--- Phase 1: Tail Handling ---");
+    eprintln!("\n--- Phase 1: Tail Handling ---");
 
     let mut micro_tokens: Vec<usize> = Vec::new();
     let mut small_tokens: Vec<usize> = Vec::new();
@@ -184,28 +184,28 @@ pub fn allocate_centroids_damped_spread(
     let small_budget = small_tokens.len() * 2;
     let tail_budget = micro_budget + small_budget;
 
-    println!(
+    eprintln!(
         "Micro tokens (< {}): {} tokens → {} centroids",
         micro_threshold,
         micro_tokens.len(),
         micro_budget
     );
-    println!(
+    eprintln!(
         "Small tokens ({}-{}): {} tokens → {} centroids",
         micro_threshold,
         small_threshold,
         small_tokens.len(),
         small_budget
     );
-    println!(
+    eprintln!(
         "Active tokens (≥ {}): {} tokens",
         small_threshold,
         active_tokens.len()
     );
-    println!("Tail budget used: {}", tail_budget);
+    eprintln!("Tail budget used: {}", tail_budget);
 
     let remaining_budget = total_centroids.saturating_sub(tail_budget);
-    println!("Remaining budget for active tokens: {}", remaining_budget);
+    eprintln!("Remaining budget for active tokens: {}", remaining_budget);
 
     let mut allocation: HashMap<usize, usize> = HashMap::new();
     for &token_id in &micro_tokens {
@@ -216,14 +216,14 @@ pub fn allocate_centroids_damped_spread(
     }
 
     if active_tokens.is_empty() || remaining_budget == 0 {
-        println!("\n=== Allocation Complete (no active tokens or budget) ===");
-        println!("Total allocated: {}", allocation.values().sum::<usize>());
+        eprintln!("\n=== Allocation Complete (no active tokens or budget) ===");
+        eprintln!("Total allocated: {}", allocation.values().sum::<usize>());
         return allocation;
     }
 
     // ── Phase 2: Damped scoring ───────────────────────────────────────────────
-    println!("\n--- Phase 2: Damped Scoring ---");
-    println!(
+    eprintln!("\n--- Phase 2: Damped Scoring ---");
+    eprintln!(
         "Computing spread measures for {} active tokens...",
         active_tokens.len()
     );
@@ -237,7 +237,7 @@ pub fn allocate_centroids_damped_spread(
         })
         .collect();
 
-    println!("✓ Spread computation in {:.2?}", spread_start.elapsed());
+    eprintln!("✓ Spread computation in {:.2?}", spread_start.elapsed());
 
     let damped_scores: Vec<(usize, usize, f64, f64)> = spread_measures
         .iter()
@@ -250,11 +250,11 @@ pub fn allocate_centroids_damped_spread(
     let total_score: f64 = damped_scores.iter().map(|&(_, _, _, s)| s).sum();
 
     if verbose {
-        println!("\nTop 10 damped scores:");
+        eprintln!("\nTop 10 damped scores:");
         let mut sorted = damped_scores.clone();
         sorted.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap());
         for (i, (token_id, count, spread, score)) in sorted.iter().take(10).enumerate() {
-            println!(
+            eprintln!(
                 "  {}. Token {}: count={}, spread={:.4}, score={:.4}",
                 i + 1,
                 token_id,
@@ -279,7 +279,7 @@ pub fn allocate_centroids_damped_spread(
     };
 
     // ── Phase 3: Bounding (floor + cap) ──────────────────────────────────────
-    println!("\n--- Phase 3: Bounding ---");
+    eprintln!("\n--- Phase 3: Bounding ---");
 
     let mut bounded: Vec<(usize, usize, f64, bool)> = Vec::new();
 
@@ -294,7 +294,7 @@ pub fn allocate_centroids_damped_spread(
         bounded.push((*token_id, final_alloc, frac, is_capped));
     }
 
-    println!(
+    eprintln!(
         "Tokens hitting floor ({}): {}",
         hard_floor,
         bounded
@@ -302,7 +302,7 @@ pub fn allocate_centroids_damped_spread(
             .filter(|&&(_, a, _, _)| a == hard_floor)
             .count()
     );
-    println!(
+    eprintln!(
         "Tokens hitting cap: {}",
         bounded.iter().filter(|&&(_, _, _, c)| c).count()
     );
@@ -310,10 +310,10 @@ pub fn allocate_centroids_damped_spread(
     if verbose {
         let mut sorted_b = bounded.clone();
         sorted_b.sort_by_key(|&(_, a, _, _)| std::cmp::Reverse(a));
-        println!("\nTop 5 provisional allocations:");
+        eprintln!("\nTop 5 provisional allocations:");
         for (i, (token_id, alloc, _, is_capped)) in sorted_b.iter().take(5).enumerate() {
             let count = token_groups[token_id].len();
-            println!(
+            eprintln!(
                 "  {}. Token {}: {} vectors → {} centroids ({:.0} vecs/centroid){}",
                 i + 1,
                 token_id,
@@ -326,13 +326,13 @@ pub fn allocate_centroids_damped_spread(
     }
 
     // ── Phase 4: Budget reconciliation ───────────────────────────────────────
-    println!("\n--- Phase 4: Budget Reconciliation ---");
+    eprintln!("\n--- Phase 4: Budget Reconciliation ---");
 
     let active_sum: usize = bounded.iter().map(|&(_, a, _, _)| a).sum();
     let current_total = tail_budget + active_sum;
     let diff = total_centroids as i64 - current_total as i64;
 
-    println!(
+    eprintln!(
         "Current: {} (tail: {}, active: {}), target: {}, diff: {}",
         current_total, tail_budget, active_sum, total_centroids, diff
     );
@@ -375,7 +375,7 @@ pub fn allocate_centroids_damped_spread(
 
         let remaining_surplus = surplus - distributed;
         if remaining_surplus > 0 {
-            println!(
+            eprintln!(
                 "Still {} surplus after non-capped pass; distributing by fractional remainder",
                 remaining_surplus
             );
@@ -393,7 +393,7 @@ pub fn allocate_centroids_damped_spread(
             }
         }
 
-        println!("Distributed {} surplus centroids", distributed);
+        eprintln!("Distributed {} surplus centroids", distributed);
     } else if diff < 0 {
         let deficit = (-diff) as usize;
         let mut removed = 0;
@@ -411,11 +411,11 @@ pub fn allocate_centroids_damped_spread(
                 }
             }
             if !made_progress {
-                println!("Warning: cannot remove more centroids without going below floor");
+                eprintln!("Warning: cannot remove more centroids without going below floor");
                 break;
             }
         }
-        println!("Removed {} deficit centroids", removed);
+        eprintln!("Removed {} deficit centroids", removed);
     }
 
     for (token_id, alloc, _, _) in bounded {
@@ -424,24 +424,24 @@ pub fn allocate_centroids_damped_spread(
 
     // ── Summary ───────────────────────────────────────────────────────────────
     let total_allocated: usize = allocation.values().sum();
-    println!("\n=== Damped Spread Allocation Summary ===");
-    println!("Total allocated: {}", total_allocated);
+    eprintln!("\n=== Damped Spread Allocation Summary ===");
+    eprintln!("Total allocated: {}", total_allocated);
     if total_allocated != total_centroids {
-        println!(
+        eprintln!(
             "⚠ Mismatch by {} centroids",
             (total_allocated as i64 - total_centroids as i64).abs()
         );
     } else {
-        println!("✓ Budget exactly matched");
+        eprintln!("✓ Budget exactly matched");
     }
 
     if verbose {
-        println!("\nTop 20 allocations:");
+        eprintln!("\nTop 20 allocations:");
         let mut sorted: Vec<_> = allocation.iter().collect();
         sorted.sort_by_key(|(_, k)| std::cmp::Reverse(*k));
         for (i, (token_id, k)) in sorted.iter().take(20).enumerate() {
             let n = token_groups[token_id].len();
-            println!(
+            eprintln!(
                 "  {}. Token {}: {} vectors → {} centroids ({:.2} vecs/centroid)",
                 i + 1,
                 token_id,

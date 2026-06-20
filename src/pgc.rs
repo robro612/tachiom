@@ -231,7 +231,7 @@ impl ProximityGraphClustering {
         let mut rng = StdRng::seed_from_u64(self.seed);
 
         if self.verbose {
-            println!(
+            eprintln!(
                 "=== PGC: {} vectors × dim={}, {} centroids, {} iters, strategy={:?} ===",
                 n_vectors, dim, n_centroids, self.n_iter, self.empty_strategy
             );
@@ -258,7 +258,7 @@ impl ProximityGraphClustering {
         for iter in 0..self.n_iter {
             if n_active == 0 {
                 if self.verbose {
-                    println!(
+                    eprintln!(
                         "  PGC: all anchors removed before iter {} — stopping early",
                         iter + 1
                     );
@@ -446,7 +446,7 @@ impl ProximityGraphClustering {
             }
 
             if self.verbose {
-                println!(
+                eprintln!(
                     "  PGC iter {}/{}: {} active anchors, {} empty (strategy: {:?}) — {:.2?}",
                     iter + 1,
                     self.n_iter,
@@ -473,7 +473,7 @@ impl ProximityGraphClustering {
 
         // ── Step 3: Final assignment over all corpus vectors ──────────────────
         if self.verbose {
-            println!(
+            eprintln!(
                 "=== PGC: Final assignment ({} vectors → {} anchors) ===",
                 n_vectors, n_active
             );
@@ -507,7 +507,7 @@ impl ProximityGraphClustering {
                 if verbose {
                     let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
                     if done % print_every == 0 || done == n_vectors {
-                        println!(
+                        eprintln!(
                             "  Final assign: {}/{} ({:.0}%)",
                             done,
                             n_vectors,
@@ -520,7 +520,7 @@ impl ProximityGraphClustering {
             .collect();
 
         if self.verbose {
-            println!(
+            eprintln!(
                 "✓ PGC complete in {:.2?} — {} centroids",
                 total_start.elapsed(),
                 n_active

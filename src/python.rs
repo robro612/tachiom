@@ -391,6 +391,7 @@ fn time_pgc_clustering(
     vectors, token_ids, doclens, *,
     total_centroids = None, tac_n_iter = 10,
     tac_micro_threshold = None, tac_small_threshold = None, max_sample_size = None,
+    verbose = false,
 ))]
 #[allow(clippy::too_many_arguments)]
 fn cluster_tac(
@@ -403,6 +404,7 @@ fn cluster_tac(
     tac_micro_threshold: Option<usize>,
     tac_small_threshold: Option<usize>,
     max_sample_size: Option<usize>,
+    verbose: bool,
 ) -> PyResult<(Py<PyArray2<f32>>, Py<PyArray1<u32>>)> {
     let (dataset, token_ids_vec) = dataset_from_arrays(&vectors, &token_ids, &doclens)?;
     let ids_u32 = token_ids
@@ -413,7 +415,7 @@ fn cluster_tac(
     );
     let tac = TacBuilder::new()
         .n_iter(tac_n_iter)
-        .verbose(false)
+        .verbose(verbose)
         .max_sample_size(max_sample_size)
         .alloc_params(TacAllocParams {
             micro_threshold: resolved.micro_threshold,
@@ -440,7 +442,7 @@ fn cluster_tac(
     total_centroids = None, pgc_n_iter = 10, pgc_sample_multiplier = 5,
     pgc_empty_strategy = "resample", pgc_iter_hnsw_m = 16, pgc_iter_ef_construction = 200,
     pgc_iter_ef_search = 50, pgc_iter_lambda = None, pgc_assign_topm = 1,
-    pgc_assign_temp = 0.1, pgc_seed = 42,
+    pgc_assign_temp = 0.1, pgc_seed = 42, verbose = false,
 ))]
 #[allow(clippy::too_many_arguments)]
 fn cluster_pgc(
@@ -459,6 +461,7 @@ fn cluster_pgc(
     pgc_assign_topm: usize,
     pgc_assign_temp: f32,
     pgc_seed: u64,
+    verbose: bool,
 ) -> PyResult<(Py<PyArray2<f32>>, Py<PyArray1<u32>>)> {
     let empty_strategy = match pgc_empty_strategy {
         "resample" => EmptyAnchorStrategy::Resample,
@@ -487,7 +490,7 @@ fn cluster_pgc(
         .assign_topm(pgc_assign_topm)
         .assign_temp(pgc_assign_temp)
         .seed(pgc_seed)
-        .verbose(false)
+        .verbose(verbose)
         .build();
     let dim = dataset.encoder().input_dim();
     let n_tokens = dataset.values().len() / dim;

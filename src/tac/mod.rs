@@ -202,7 +202,7 @@ impl TokenAwareClustering {
         }
 
         if self.verbose {
-            println!(
+            eprintln!(
                 "=== TAC: {} vectors × dim={}, {} unique token types, budget={} centroids ===",
                 n_vectors,
                 dim,
@@ -273,7 +273,7 @@ impl TokenAwareClustering {
         // ── Per-token k-means (parallel) ──────────────────────────────────────
         let n_groups = token_groups.len();
         if self.verbose {
-            println!("\n=== Training per-token k-means ({} groups) ===", n_groups);
+            eprintln!("\n=== Training per-token k-means ({} groups) ===", n_groups);
         }
 
         let completed = AtomicUsize::new(0);
@@ -299,7 +299,7 @@ impl TokenAwareClustering {
                 );
                 let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
                 if self.verbose && (done % print_every == 0 || done == n_groups) {
-                    println!(
+                    eprintln!(
                         "  k-means: {}/{} groups ({:.0}%) — {:.1}s elapsed",
                         done,
                         n_groups,
@@ -313,7 +313,7 @@ impl TokenAwareClustering {
 
         // ── Concatenate centroids, remap assignments to global ids ────────────
         if self.verbose {
-            println!("\n=== Concatenating centroids and remapping assignments ===");
+            eprintln!("\n=== Concatenating centroids and remapping assignments ===");
         }
 
         // Sort by token_id for a deterministic, reproducible layout.
@@ -338,7 +338,7 @@ impl TokenAwareClustering {
         let n_centroids = all_centroids.len() / dim;
 
         if self.verbose {
-            println!(
+            eprintln!(
                 "✓ TAC complete in {:.2?} — {} centroids produced",
                 train_start.elapsed(),
                 n_centroids
