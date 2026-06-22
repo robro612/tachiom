@@ -51,11 +51,12 @@ name = "bench_tac"
 path = "src/bin/bench_tac.rs"
 required-features = ["cli"]
 
-# EXPERIMENT (coarse-mode-experiment branch): local vectorium fork adding
-# compute_centroid_distance for the full-coarse rerank experiment. Revert this
-# [patch] block + delete /exp/rjha/vectorium-coarse-fork to abandon cleanly.
+# EXPERIMENT (coarse-mode-experiment branch): vectorium fork adding
+# compute_centroid_distance[_batch] for the full-coarse rerank experiment.
+# Points at the pushed fork so a fresh clone reproduces without a local path.
+# (Cargo.lock pins the exact commit.) See experiment/README.md.
 [patch."https://github.com/TusKANNy/vectorium.git"]
-vectorium = { path = "/exp/rjha/vectorium-coarse-fork" }
+vectorium = { git = "https://github.com/robro612/vectorium.git", branch = "coarse-only" }
 
 [profile.release]
 opt-level = 3

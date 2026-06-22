@@ -1,0 +1,241 @@
+From 298bdeabaf2997d2b676021d0f16efe5eee0ca77 Mon Sep 17 00:00:00 2001
+From: Rohan Jha <robro612@gmail.com>
+Date: Mon, 22 Jun 2026 13:20:32 -0400
+Subject: [PATCH] Add centroid-only MaxSim (compute_centroid_distance[_batch])
+
+For the tachiom full-coarse experiment: un-truncated centroid-quantized MaxSim
+over a doc's stored per-token coarse ids, skipping the PQ-residual term. Batched
+variant amortises the GEMM over chunks of docs.
+---
+ src/encoders/multivec_two_level_pq.rs | 215 ++++++++++++++++++++++++++
+ 1 file changed, 215 insertions(+)
+
+diff --git a/src/encoders/multivec_two_level_pq.rs b/src/encoders/multivec_two_level_pq.rs
+index 184b685..45edb41 100644
+--- a/src/encoders/multivec_two_level_pq.rs
++++ b/src/encoders/multivec_two_level_pq.rs
+@@ -747,6 +747,221 @@ where
+             centroid_gemm_us: Cell::new(0.0),
+         }
+     }
++
++    /// Centroid-only MaxSim: approximate each document token by its coarse centroid
++    /// vector (no PQ-residual term) and reduce with ColBERT MaxSim.
++    ///
++    /// This is exactly Phase 1 of [`compute_distance`] (coarse-id extraction + centroid
++    /// GEMM) followed by `Σ_q max_t centroid_scores[t, q]`, skipping Phase 2's PQ table
++    /// lookup. It yields the *un-truncated* centroid-quantized MaxSim for a document —
++    /// the same per-centroid quantity the IVF scatter uses, but over ALL of the
++    /// document's token-centroids rather than only the probed ones. No norm scaling is
++    /// applied (matches the coarse IVF similarity semantics).
++    pub fn compute_centroid_distance(&self, vector: DenseMultiVectorView<'_, u8>) -> f32 {
++        let mut sp = self.scratchpad.borrow_mut();
++
++        let doc_n = vector.num_vecs();
++        if doc_n == 0 {
++            return 0.0;
++        }
++        let token_dim = self.encoder.token_dim;
++        let doc_bytes = vector.values();
++
++        sp.ensure_capacity(doc_n);
++
++        // Phase 1b — extract coarse centroid for each doc token.
++        // SAFETY: blocked layout guarantees the first COARSE_ID_BYTES*doc_n bytes are coarse IDs;
++        //         centroid_cols is completely overwritten before any read.
++        unsafe {
++            let doc_ptr = doc_bytes.as_ptr();
++            let centroids_ptr = self.encoder.coarse_centroids.values().as_ptr();
++            let dest_ptr = sp.centroid_cols.as_mut_ptr();
++            for t in 0..doc_n {
++                let bo = t * COARSE_ID_BYTES;
++                let c0 = *doc_ptr.add(bo) as u32;
++                let c1 = *doc_ptr.add(bo + 1) as u32;
++                let c2 = *doc_ptr.add(bo + 2) as u32;
++                let c3 = *doc_ptr.add(bo + 3) as u32;
++                let coarse_id = (c0 | (c1 << 8) | (c2 << 16) | (c3 << 24)) as usize;
++                std::ptr::copy_nonoverlapping(
++                    centroids_ptr.add(coarse_id * token_dim),
++                    dest_ptr.add(t * token_dim),
++                    token_dim,
++                );
++            }
++        }
++
++        // Phase 1c — GEMM: centroid_scores = centroid_cols × query_flat_t^T
++        unsafe {
++            let a = mat::from_raw_parts::<f32>(
++                sp.centroid_cols.as_ptr(),
++                doc_n,
++                token_dim,
++                token_dim as isize,
++                1,
++            );
++            let b = mat::from_raw_parts::<f32>(
++                self.query_flat_t.as_ptr(),
++                token_dim,
++                sp.q_token,
++                sp.q_token as isize,
++                1,
++            );
++            let mut c = mat::from_raw_parts_mut::<f32>(
++                sp.centroid_scores.as_mut_ptr(),
++                doc_n,
++                sp.q_token,
++                sp.q_token as isize,
++                1,
++            );
++            matmul(c.as_mut(), a, b, None, 1.0, Parallelism::None);
++        }
++
++        // Centroid-only MaxSim: Σ_q max_t centroid_scores[t, q]
++        let q_token = sp.q_token;
++        let cs = &sp.centroid_scores[..doc_n * q_token];
++        let mut total = 0f32;
++        for q in 0..q_token {
++            let mut best = f32::NEG_INFINITY;
++            for t in 0..doc_n {
++                let v = cs[t * q_token + q];
++                if v > best {
++                    best = v;
++                }
++            }
++            total += best;
++        }
++        total
++    }
++
++    /// Batched centroid-only MaxSim over many documents for one query.
++    ///
++    /// Equivalent to calling [`compute_centroid_distance`] per doc, but amortises the GEMM:
++    /// it gathers the coarse-centroid columns for a CHUNK of documents into one contiguous
++    /// buffer, runs a single `[chunk_tokens × token_dim] × [token_dim × q_token]` matmul, then
++    /// segmented-max-reduces per document. This turns tens of thousands of tiny per-doc matmul
++    /// calls into a handful of BLAS-efficient ones — the overhead, not the FLOPs, was the cost.
++    /// Chunking bounds peak scratch memory. Returns one score per input doc, in input order.
++    pub fn compute_centroid_distance_batch(&self, docs: &[DenseMultiVectorView<'_, u8>]) -> Vec<f32> {
++        let n_docs = docs.len();
++        let mut out = vec![0f32; n_docs];
++        if n_docs == 0 {
++            return out;
++        }
++        let token_dim = self.encoder.token_dim;
++        let q_token = self.scratchpad.borrow().q_token;
++
++        // ~1024 docs/chunk: at ~68 tok/doc, dim 128 -> col_buf ~36MB, score_buf ~8MB per call.
++        const CHUNK_DOCS: usize = 1024;
++        let centroids_ptr = self.encoder.coarse_centroids.values().as_ptr();
++
++        let mut col_buf: Vec<f32> = Vec::new();
++        let mut score_buf: Vec<f32> = Vec::new();
++        let mut doc_lens: Vec<usize> = Vec::with_capacity(CHUNK_DOCS);
++        let mut maxacc: Vec<f32> = vec![f32::NEG_INFINITY; q_token];
++
++        let mut d0 = 0usize;
++        while d0 < n_docs {
++            let d1 = (d0 + CHUNK_DOCS).min(n_docs);
++
++            doc_lens.clear();
++            let mut chunk_tokens = 0usize;
++            for d in &docs[d0..d1] {
++                let n = d.num_vecs();
++                doc_lens.push(n);
++                chunk_tokens += n;
++            }
++            if chunk_tokens == 0 {
++                d0 = d1;
++                continue;
++            }
++
++            // Gather coarse-centroid columns for every token in the chunk.
++            // SAFETY: blocked layout -> first COARSE_ID_BYTES*doc_n bytes are coarse IDs;
++            //         col_buf is fully overwritten before the GEMM reads it.
++            col_buf.clear();
++            col_buf.reserve(chunk_tokens * token_dim);
++            unsafe {
++                col_buf.set_len(chunk_tokens * token_dim);
++                let dest = col_buf.as_mut_ptr();
++                let mut t_off = 0usize;
++                for (li, d) in docs[d0..d1].iter().enumerate() {
++                    let n = doc_lens[li];
++                    let doc_ptr = d.values().as_ptr();
++                    for t in 0..n {
++                        let bo = t * COARSE_ID_BYTES;
++                        let c0 = *doc_ptr.add(bo) as u32;
++                        let c1 = *doc_ptr.add(bo + 1) as u32;
++                        let c2 = *doc_ptr.add(bo + 2) as u32;
++                        let c3 = *doc_ptr.add(bo + 3) as u32;
++                        let coarse_id = (c0 | (c1 << 8) | (c2 << 16) | (c3 << 24)) as usize;
++                        std::ptr::copy_nonoverlapping(
++                            centroids_ptr.add(coarse_id * token_dim),
++                            dest.add((t_off + t) * token_dim),
++                            token_dim,
++                        );
++                    }
++                    t_off += n;
++                }
++            }
++
++            // One GEMM: centroid_scores = chunk_cols × query_flat_t^T
++            score_buf.clear();
++            score_buf.reserve(chunk_tokens * q_token);
++            unsafe {
++                score_buf.set_len(chunk_tokens * q_token);
++                let a = mat::from_raw_parts::<f32>(
++                    col_buf.as_ptr(),
++                    chunk_tokens,
++                    token_dim,
++                    token_dim as isize,
++                    1,
++                );
++                let b = mat::from_raw_parts::<f32>(
++                    self.query_flat_t.as_ptr(),
++                    token_dim,
++                    q_token,
++                    q_token as isize,
++                    1,
++                );
++                let mut c = mat::from_raw_parts_mut::<f32>(
++                    score_buf.as_mut_ptr(),
++                    chunk_tokens,
++                    q_token,
++                    q_token as isize,
++                    1,
++                );
++                // Parallelism::None: the batch_search caller already parallelises across queries.
++                matmul(c.as_mut(), a, b, None, 1.0, Parallelism::None);
++            }
++
++            // Segmented MaxSim per doc: Σ_q max_t score_buf[token, q]. Sequential reads.
++            let mut t_off = 0usize;
++            for (li, &n) in doc_lens.iter().enumerate() {
++                if n == 0 {
++                    out[d0 + li] = 0.0;
++                    continue;
++                }
++                for v in maxacc.iter_mut() {
++                    *v = f32::NEG_INFINITY;
++                }
++                for t in 0..n {
++                    let base = (t_off + t) * q_token;
++                    for q in 0..q_token {
++                        let v = score_buf[base + q];
++                        if v > maxacc[q] {
++                            maxacc[q] = v;
++                        }
++                    }
++                }
++                out[d0 + li] = maxacc.iter().sum();
++                t_off += n;
++            }
++
++            d0 = d1;
++        }
++        out
++    }
+ }
+ 
+ impl<'e, 'v, const M: usize, In> QueryEvaluator<DenseMultiVectorView<'v, u8>>
+-- 
+2.47.1
+
