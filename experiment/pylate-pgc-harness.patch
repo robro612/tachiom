@@ -1,0 +1,62 @@
+diff --git a/conf/eval/index/tachiom.yaml b/conf/eval/index/tachiom.yaml
+index 376499d..5f8e9ab 100644
+--- a/conf/eval/index/tachiom.yaml
++++ b/conf/eval/index/tachiom.yaml
+@@ -30,3 +30,7 @@ alpha: 0.45      # candidate-pool prune width; set null for max recall with deep
+ beta: null
+ lambda_: null
+ num_threads: 0
++# EXPERIMENT (coarse-mode-experiment build only): recompute gathered candidates' coarse
++# scores as the un-truncated centroid-quantized MaxSim before the kd cut. Default false =
++# current behavior; requires the experimental tachiom wheel (base 0.3.0 lacks the kwarg).
++full_coarse: false
+diff --git a/pylate/indexes/tachiom.py b/pylate/indexes/tachiom.py
+index 2d55ff6..523d27c 100644
+--- a/pylate/indexes/tachiom.py
++++ b/pylate/indexes/tachiom.py
+@@ -156,6 +156,9 @@ class TachiomIndex(Base):
+         beta: int | None = None,
+         lambda_: float | None = None,
+         num_threads: int = 0,
++        # EXPERIMENT (coarse-mode-experiment build): recompute gathered candidates'
++        # coarse scores as the un-truncated centroid-quantized MaxSim before pruning.
++        full_coarse: bool = False,
+         # Local extension: PGC clustering (requires local tachiom build)
+         clustering: str = "tac",
+         pgc_n_iter: int = 10,
+@@ -212,6 +215,7 @@ class TachiomIndex(Base):
+         self.beta = beta
+         self.lambda_ = lambda_
+         self.num_threads = num_threads
++        self.full_coarse = full_coarse
+ 
+         self.clustering = clustering
+         self.pgc_n_iter = pgc_n_iter
+@@ -695,6 +699,7 @@ class TachiomIndex(Base):
+             alpha=self.alpha,
+             beta=self.beta,
+             lambda_=self.lambda_,
++            full_coarse=self.full_coarse,
+         )
+ 
+         results = []
+diff --git a/scripts/benchmark_indexes.py b/scripts/benchmark_indexes.py
+index ca157db..98172be 100644
+--- a/scripts/benchmark_indexes.py
++++ b/scripts/benchmark_indexes.py
+@@ -941,6 +941,7 @@ def build_index(
+             beta=index_cfg.get("beta", None) if index_cfg else None,
+             lambda_=index_cfg.get("lambda_", None) if index_cfg else None,
+             num_threads=index_cfg.get("num_threads", 0) if index_cfg else 0,
++            full_coarse=index_cfg.get("full_coarse", False) if index_cfg else False,
+             # Local PGC extension
+             clustering=clustering_type,
+             pgc_n_iter=cl.get("n_iter", 10) if cl else 10,
+@@ -1194,6 +1195,7 @@ def load_existing_index(
+             beta=index_cfg.get("beta", None) if index_cfg else None,
+             lambda_=index_cfg.get("lambda_", None) if index_cfg else None,
+             num_threads=index_cfg.get("num_threads", 0) if index_cfg else 0,
++            full_coarse=index_cfg.get("full_coarse", False) if index_cfg else False,
+         )
+     else:
+         raise ValueError(f"Unknown index type: {index_type}")

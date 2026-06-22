@@ -1131,6 +1131,7 @@ impl PyTachiom {
         alpha = Some(0.45),
         beta = None,
         lambda_ = None,
+        full_coarse = false,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn search<'py>(
@@ -1144,6 +1145,7 @@ impl PyTachiom {
         alpha: Option<f32>,
         beta: Option<usize>,
         lambda_: Option<f32>,
+        full_coarse: bool,
     ) -> PyResult<(Py<PyArray1<f32>>, Py<PyArray1<u32>>)> {
         let ef_search = ef_search.unwrap_or_else(|| ((k_centroids as f64) * 1.5).round() as usize);
         let dim = with_inner!(self, t => t.residuals.encoder().input_dim());
@@ -1160,6 +1162,7 @@ impl PyTachiom {
                 alpha,
                 beta,
                 lambda_,
+                full_coarse,
             ))
         });
 
@@ -1201,6 +1204,7 @@ impl PyTachiom {
         alpha = Some(0.45),
         beta = None,
         lambda_ = None,
+        full_coarse = false,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn batch_search<'py>(
@@ -1217,6 +1221,7 @@ impl PyTachiom {
         alpha: Option<f32>,
         beta: Option<usize>,
         lambda_: Option<f32>,
+        full_coarse: bool,
     ) -> PyResult<(Py<PyArray2<f32>>, Py<PyArray2<u32>>)> {
         let ef_search = ef_search.unwrap_or_else(|| ((k_centroids as f64) * 1.5).round() as usize);
         let dim = with_inner!(self, t => t.residuals.encoder().input_dim());
@@ -1305,6 +1310,7 @@ impl PyTachiom {
                 beta,
                 lambda_,
                 num_threads,
+                full_coarse,
             ))
         });
 

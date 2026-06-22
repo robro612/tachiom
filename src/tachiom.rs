@@ -560,6 +560,30 @@ impl<const M: usize> Tachiom<M> {
         }
     }
 
+    /// EXPERIMENT (full-coarse mode): recompute the gathered candidates' coarse scores as
+    /// the *un-truncated* centroid-quantized MaxSim, using ALL of each doc's token-centroids
+    /// (not just the probed ones). Holds the candidate SET fixed (keys of `doc_scores`
+    /// unchanged) and only overwrites the score values, isolating the effect of the probe
+    /// truncation on candidate ranking/pruning from candidate generation.
+    ///
+    /// Reuses each doc's stored per-token coarse ids via `residuals.get` — no posting list.
+    fn recompute_coarse_full(
+        &self,
+        query: vectorium::DenseMultiVectorView<'_, f32>,
+        doc_scores: &mut FxHashMap<u32, f32>,
+    ) {
+        let evaluator = self.residuals.encoder().query_evaluator(query);
+        // Collect candidate ids and their encoded views, then score in one batched pass
+        // (amortised GEMM) instead of a tiny matmul per doc.
+        let doc_ids: Vec<u32> = doc_scores.keys().copied().collect();
+        let views: Vec<vectorium::DenseMultiVectorView<'_, u8>> =
+            doc_ids.iter().map(|&id| self.residuals.get(id as u64)).collect();
+        let scores = evaluator.compute_centroid_distance_batch(&views);
+        for (&doc_id, &s) in doc_ids.iter().zip(scores.iter()) {
+            doc_scores.insert(doc_id, s);
+        }
+    }
+
     /// Stage 2: turn the coarse-score map into a sorted, alpha-pruned candidate list.
     fn select_candidates(
         doc_scores: FxHashMap<u32, f32>,
@@ -684,12 +708,19 @@ impl<const M: usize> Tachiom<M> {
         alpha: Option<f32>,
         beta: Option<usize>,
         lambda: Option<f32>,
+        full_coarse: bool,
     ) -> Vec<(f32, u32)> {
         let search_params = Self::build_search_params(ef_search, lambda);
 
         let mut doc_scores: FxHashMap<u32, f32> = FxHashMap::default();
         doc_scores.reserve(4096);
         self.accumulate_coarse_scores(query, k_centroids, &search_params, &mut doc_scores);
+
+        // EXPERIMENT: replace the probe-truncated coarse scores with the un-truncated
+        // centroid-quantized MaxSim before pruning. Candidate set is unchanged.
+        if full_coarse {
+            self.recompute_coarse_full(query, &mut doc_scores);
+        }
 
         let candidates = Self::select_candidates(doc_scores, k, k_docs_to_score, alpha);
         self.rerank_candidates(query, &candidates, k, beta)
@@ -719,6 +750,7 @@ impl<const M: usize> Tachiom<M> {
         beta: Option<usize>,
         lambda: Option<f32>,
         num_threads: usize,
+        full_coarse: bool,
     ) -> Vec<Vec<(f32, u32)>> {
         use rayon::prelude::*;
 
@@ -735,6 +767,7 @@ impl<const M: usize> Tachiom<M> {
                         alpha,
                         beta,
                         lambda,
+                        full_coarse,
                     )
                 })
                 .collect()
@@ -752,6 +785,7 @@ impl<const M: usize> Tachiom<M> {
                         alpha,
                         beta,
                         lambda,
+                        full_coarse,
                     )
                 })
                 .collect()
@@ -1071,6 +1105,7 @@ impl<const M: usize> Index<TachiomInputDataset> for Tachiom<M> {
             search_params.alpha,
             search_params.beta,
             search_params.lambda,
+            false, // full_coarse: trait path keeps default (truncated) behavior
         )
         .into_iter()
         .map(|(score, doc_id)| ScoredVector {
