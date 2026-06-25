@@ -120,6 +120,8 @@ fn main() -> anyhow::Result<()> {
         alpha: args.alpha,
         beta: args.beta,
         lambda: args.lambda,
+        impute_missing: false,
+        gap_relative: false,
     };
 
     // ── Build query dataset (outside the timer) ───────────────────────────────

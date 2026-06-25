@@ -68,15 +68,32 @@ pub struct SearchTimings {
     pub stage3_ns: u128,
 }
 
-/// Retain only candidates whose score is within `alpha` fraction of the k-th best score.
+/// Retain only candidates whose score is within `alpha` of the k-th best score.
 /// No-ops when `alpha` is `None`, `k` is 0, or `candidates` is empty.
-fn prune_by_alpha(candidates: &mut Vec<(u32, f32)>, alpha: Option<f32>, k: usize) {
+///
+/// Two thresholding modes:
+/// - `gap_relative = false` (default/historical): `s_k - |s_k|·α` — a multiplicative
+///   band on the k-th score's magnitude. NOT shift-invariant.
+/// - `gap_relative = true`: `s_k - α·(s_best - s_k)` — the shift-invariant analog of
+///   the magnitude band, replacing the scale `|s_k|` with the best→k-th gap. Keeps
+///   the top-k plus any candidate within an α fraction of that gap *below* s_k.
+///   Invariant to any per-query additive constant (e.g. XTR imputation's `Σ m_i`),
+///   so pruning stays functional when imputation inflates scores.
+///
+/// `candidates` must be sorted descending by score.
+fn prune_by_alpha(candidates: &mut Vec<(u32, f32)>, alpha: Option<f32>, k: usize, gap_relative: bool) {
     let Some(alpha_val) = alpha else { return };
     if candidates.is_empty() || k == 0 {
         return;
     }
     let kth_idx = k.min(candidates.len()) - 1;
-    let threshold = candidates[kth_idx].1 - candidates[kth_idx].1.abs() * alpha_val;
+    let s_k = candidates[kth_idx].1;
+    let threshold = if gap_relative {
+        let s_best = candidates[0].1;
+        s_k - alpha_val * (s_best - s_k)
+    } else {
+        s_k - s_k.abs() * alpha_val
+    };
     candidates.retain(|&(_, s)| s >= threshold);
 }
 
@@ -526,18 +543,53 @@ impl<const M: usize> Tachiom<M> {
     ///
     /// For each query token, probes `k_centroids` centroids via HNSW and records
     /// the best centroid similarity per document, then adds it to `doc_scores`.
+    ///
+    /// When `impute_missing` is set, applies the XTR-style missing-score
+    /// imputation. A document that is in none of the probed centroids' inverted
+    /// lists for a query token implicitly scores 0 on that token, which biases
+    /// candidate selection against docs whose best-matching centroid fell just
+    /// outside the top-`k_centroids` probe. XTR instead imputes such a missing
+    /// contribution with `m_i`, the *minimum* retrieved centroid similarity for
+    /// that query token — an upper bound on the true (unretrieved) contribution.
+    ///
+    /// Imputing `m_i` for every missing (token, doc) pair gives each candidate
+    /// (any doc with ≥1 hit) the score `Σ_i m_i + Σ_{hit}(best_sim - m_i)`. We
+    /// realise this in two parts: subtract `m_i` from each hit during the per-token
+    /// pass, then add the per-query constant `Σ_i m_i` back to every candidate at
+    /// the end. The constant is rank-invariant for top-k selection (it could be
+    /// dropped there), but `prune_by_alpha`'s threshold `kth - |kth|·α` is *not*
+    /// shift-invariant, so keeping the constant puts scores on the true
+    /// imputed-CQMS scale and lets alpha-pruning operate correctly. No-op when
+    /// `impute_missing` is false (`m_i = 0`).
     fn accumulate_coarse_scores(
         &self,
         query: vectorium::DenseMultiVectorView<'_, f32>,
         k_centroids: usize,
         search_params: &HNSWSearchConfiguration,
+        impute_missing: bool,
         doc_scores: &mut FxHashMap<u32, f32>,
     ) {
         let mut best_per_doc: FxHashMap<u32, f32> = FxHashMap::default();
         best_per_doc.reserve(128);
 
+        // Σ_i m_i: the per-query imputation constant, added back after the loop.
+        let mut m_sum = 0.0f32;
+
         for q_token in query.iter_vectors() {
             let centroids_res = self.centroids.search(q_token, k_centroids, search_params);
+
+            // m_i: minimum retrieved centroid similarity for this query token.
+            // Subtracted from every hit so that a missing doc is implicitly
+            // credited m_i (XTR imputation, see doc comment).
+            let m_i = if impute_missing {
+                centroids_res
+                    .iter()
+                    .map(|sv| sv.distance.distance())
+                    .fold(f32::INFINITY, f32::min)
+            } else {
+                0.0
+            };
+            m_sum += m_i;
 
             best_per_doc.clear();
             for (cidx, dist) in centroids_res
@@ -555,17 +607,30 @@ impl<const M: usize> Tachiom<M> {
             }
 
             for (&doc_id, &best_sim) in &best_per_doc {
-                *doc_scores.entry(doc_id).or_insert(0.0) += best_sim;
+                *doc_scores.entry(doc_id).or_insert(0.0) += best_sim - m_i;
+            }
+        }
+
+        // Add the dropped Σ_i m_i constant back so alpha-pruning sees true
+        // imputed-CQMS scores. Skipped when impute_missing is false (m_sum == 0).
+        if impute_missing {
+            for score in doc_scores.values_mut() {
+                *score += m_sum;
             }
         }
     }
 
     /// Stage 2: turn the coarse-score map into a sorted, alpha-pruned candidate list.
+    /// `gap_relative` selects the shift-invariant alpha threshold (see
+    /// [`prune_by_alpha`]) — required when `impute_missing` is on, since imputation
+    /// adds a per-query additive constant that the magnitude-band threshold is not
+    /// invariant to.
     fn select_candidates(
         doc_scores: FxHashMap<u32, f32>,
         k: usize,
         k_docs_to_score: usize,
         alpha: Option<f32>,
+        gap_relative: bool,
     ) -> Vec<(u32, f32)> {
         let mut docs_with_scores: Vec<(u32, f32)> = doc_scores.into_iter().collect();
 
@@ -586,7 +651,7 @@ impl<const M: usize> Tachiom<M> {
         });
 
         let mut candidates = docs_with_scores;
-        prune_by_alpha(&mut candidates, alpha, k);
+        prune_by_alpha(&mut candidates, alpha, k, gap_relative);
         candidates
     }
 
@@ -684,14 +749,22 @@ impl<const M: usize> Tachiom<M> {
         alpha: Option<f32>,
         beta: Option<usize>,
         lambda: Option<f32>,
+        impute_missing: bool,
+        gap_relative: bool,
     ) -> Vec<(f32, u32)> {
         let search_params = Self::build_search_params(ef_search, lambda);
 
         let mut doc_scores: FxHashMap<u32, f32> = FxHashMap::default();
         doc_scores.reserve(4096);
-        self.accumulate_coarse_scores(query, k_centroids, &search_params, &mut doc_scores);
+        self.accumulate_coarse_scores(
+            query,
+            k_centroids,
+            &search_params,
+            impute_missing,
+            &mut doc_scores,
+        );
 
-        let candidates = Self::select_candidates(doc_scores, k, k_docs_to_score, alpha);
+        let candidates = Self::select_candidates(doc_scores, k, k_docs_to_score, alpha, gap_relative);
         self.rerank_candidates(query, &candidates, k, beta)
     }
 
@@ -718,6 +791,8 @@ impl<const M: usize> Tachiom<M> {
         alpha: Option<f32>,
         beta: Option<usize>,
         lambda: Option<f32>,
+        impute_missing: bool,
+        gap_relative: bool,
         num_threads: usize,
     ) -> Vec<Vec<(f32, u32)>> {
         use rayon::prelude::*;
@@ -735,6 +810,8 @@ impl<const M: usize> Tachiom<M> {
                         alpha,
                         beta,
                         lambda,
+                        impute_missing,
+                        gap_relative,
                     )
                 })
                 .collect()
@@ -752,6 +829,8 @@ impl<const M: usize> Tachiom<M> {
                         alpha,
                         beta,
                         lambda,
+                        impute_missing,
+                        gap_relative,
                     )
                 })
                 .collect()
@@ -780,6 +859,8 @@ impl<const M: usize> Tachiom<M> {
         alpha: Option<f32>,
         beta: Option<usize>,
         lambda: Option<f32>,
+        impute_missing: bool,
+        gap_relative: bool,
     ) -> (Vec<(f32, u32)>, SearchTimings) {
         use std::time::Instant;
 
@@ -788,11 +869,17 @@ impl<const M: usize> Tachiom<M> {
         let t0 = Instant::now();
         let mut doc_scores: FxHashMap<u32, f32> = FxHashMap::default();
         doc_scores.reserve(4096);
-        self.accumulate_coarse_scores(query, k_centroids, &search_params, &mut doc_scores);
+        self.accumulate_coarse_scores(
+            query,
+            k_centroids,
+            &search_params,
+            impute_missing,
+            &mut doc_scores,
+        );
         let stage1_ns = t0.elapsed().as_nanos();
 
         let t1 = Instant::now();
-        let candidates = Self::select_candidates(doc_scores, k, k_docs_to_score, alpha);
+        let candidates = Self::select_candidates(doc_scores, k, k_docs_to_score, alpha, gap_relative);
         let stage2_ns = t1.elapsed().as_nanos();
 
         let t2 = Instant::now();
@@ -891,6 +978,16 @@ pub struct TachiomSearchParams {
 
     /// Lambda for distance-adaptive early termination in HNSW centroid search.
     pub lambda: Option<f32>,
+
+    /// XTR-style imputation of missing per-token coarse scores (see
+    /// [`Tachiom::accumulate_coarse_scores`]). `false` reproduces the original
+    /// 0-truncated behaviour.
+    pub impute_missing: bool,
+
+    /// Gap-relative (shift-invariant) alpha pruning: `s_k - α·(s_best - s_k)` instead
+    /// of the magnitude band `s_k - |s_k|·α`. Required when `impute_missing` is on with
+    /// `alpha` set (see [`prune_by_alpha`]); the caller is responsible for that pairing.
+    pub gap_relative: bool,
 }
 
 impl Default for TachiomSearchParams {
@@ -902,6 +999,8 @@ impl Default for TachiomSearchParams {
             alpha: Some(0.45),
             beta: None,
             lambda: None,
+            impute_missing: false,
+            gap_relative: false,
         }
     }
 }
@@ -1071,6 +1170,8 @@ impl<const M: usize> Index<TachiomInputDataset> for Tachiom<M> {
             search_params.alpha,
             search_params.beta,
             search_params.lambda,
+            search_params.impute_missing,
+            search_params.gap_relative,
         )
         .into_iter()
         .map(|(score, doc_id)| ScoredVector {
