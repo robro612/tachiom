@@ -57,17 +57,6 @@ impl PartialOrd for MinHeapScore {
     }
 }
 
-/// Per-stage wall-clock timings for a single search call, in nanoseconds.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct SearchTimings {
-    /// Stage 1: coarse-score accumulation (HNSW probes + IVF traversal).
-    pub stage1_ns: u128,
-    /// Stage 2: candidate selection (partition + sort + alpha pruning).
-    pub stage2_ns: u128,
-    /// Stage 3: full distance computation + top-k selection.
-    pub stage3_ns: u128,
-}
-
 /// Retain only candidates whose score is within `alpha` of the k-th best score.
 /// No-ops when `alpha` is `None`, `k` is 0, or `candidates` is empty.
 ///
@@ -81,7 +70,12 @@ pub struct SearchTimings {
 ///   so pruning stays functional when imputation inflates scores.
 ///
 /// `candidates` must be sorted descending by score.
-fn prune_by_alpha(candidates: &mut Vec<(u32, f32)>, alpha: Option<f32>, k: usize, gap_relative: bool) {
+fn prune_by_alpha(
+    candidates: &mut Vec<(u32, f32)>,
+    alpha: Option<f32>,
+    k: usize,
+    gap_relative: bool,
+) {
     let Some(alpha_val) = alpha else { return };
     if candidates.is_empty() || k == 0 {
         return;
@@ -574,46 +568,55 @@ impl<const M: usize> Tachiom<M> {
 
         // Σ_i m_i: the per-query imputation constant, added back after the loop.
         let mut m_sum = 0.0f32;
+        let hnsw_lookup_span = tracing::info_span!("coarse_hnsw_lookup", k_centroids = k_centroids);
+        let accumulate_span = tracing::info_span!("coarse_accumulate");
 
         for q_token in query.iter_vectors() {
-            let centroids_res = self.centroids.search(q_token, k_centroids, search_params);
-
-            // m_i: minimum retrieved centroid similarity for this query token.
-            // Subtracted from every hit so that a missing doc is implicitly
-            // credited m_i (XTR imputation, see doc comment).
-            let m_i = if impute_missing {
-                centroids_res
-                    .iter()
-                    .map(|sv| sv.distance.distance())
-                    .fold(f32::INFINITY, f32::min)
-            } else {
-                0.0
+            let centroids_res = {
+                let _guard = hnsw_lookup_span.enter();
+                self.centroids.search(q_token, k_centroids, search_params)
             };
-            m_sum += m_i;
 
-            best_per_doc.clear();
-            for (cidx, dist) in centroids_res
-                .iter()
-                .map(|sv| (sv.vector as usize, sv.distance.distance()))
             {
-                let off_start = self.offsets[cidx];
-                let off_end = self.offsets[cidx + 1];
-                for &doc_id in &self.inverted_lists[off_start..off_end] {
-                    best_per_doc
-                        .entry(doc_id)
-                        .and_modify(|prev| *prev = dist.max(*prev))
-                        .or_insert(dist);
-                }
-            }
+                let _guard = accumulate_span.enter();
+                // m_i: minimum retrieved centroid similarity for this query token.
+                // Subtracted from every hit so that a missing doc is implicitly
+                // credited m_i (XTR imputation, see doc comment).
+                let m_i = if impute_missing {
+                    centroids_res
+                        .iter()
+                        .map(|sv| sv.distance.distance())
+                        .fold(f32::INFINITY, f32::min)
+                } else {
+                    0.0
+                };
+                m_sum += m_i;
 
-            for (&doc_id, &best_sim) in &best_per_doc {
-                *doc_scores.entry(doc_id).or_insert(0.0) += best_sim - m_i;
+                best_per_doc.clear();
+                for (cidx, dist) in centroids_res
+                    .iter()
+                    .map(|sv| (sv.vector as usize, sv.distance.distance()))
+                {
+                    let off_start = self.offsets[cidx];
+                    let off_end = self.offsets[cidx + 1];
+                    for &doc_id in &self.inverted_lists[off_start..off_end] {
+                        best_per_doc
+                            .entry(doc_id)
+                            .and_modify(|prev| *prev = dist.max(*prev))
+                            .or_insert(dist);
+                    }
+                }
+
+                for (&doc_id, &best_sim) in &best_per_doc {
+                    *doc_scores.entry(doc_id).or_insert(0.0) += best_sim - m_i;
+                }
             }
         }
 
         // Add the dropped Σ_i m_i constant back so alpha-pruning sees true
         // imputed-CQMS scores. Skipped when impute_missing is false (m_sum == 0).
         if impute_missing {
+            let _guard = accumulate_span.enter();
             for score in doc_scores.values_mut() {
                 *score += m_sum;
             }
@@ -632,26 +635,39 @@ impl<const M: usize> Tachiom<M> {
         alpha: Option<f32>,
         gap_relative: bool,
     ) -> Vec<(u32, f32)> {
-        let mut docs_with_scores: Vec<(u32, f32)> = doc_scores.into_iter().collect();
+        let mut docs_with_scores: Vec<(u32, f32)> = {
+            let _span =
+                tracing::info_span!("candidate_topk", k_docs_to_score = k_docs_to_score).entered();
+            let mut docs_with_scores: Vec<(u32, f32)> = doc_scores.into_iter().collect();
 
-        let take_n = std::cmp::min(k_docs_to_score, docs_with_scores.len());
+            let take_n = std::cmp::min(k_docs_to_score, docs_with_scores.len());
 
-        // Partition at top-k position in O(n) instead of full O(n log n) sort.
-        if docs_with_scores.len() > take_n {
-            docs_with_scores.select_nth_unstable_by(take_n - 1, |a, b| {
-                b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal)
+            // Partition at top-k position in O(n) instead of full O(n log n) sort.
+            if docs_with_scores.len() > take_n {
+                docs_with_scores.select_nth_unstable_by(take_n - 1, |a, b| {
+                    b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal)
+                });
+                docs_with_scores.truncate(take_n);
+            }
+            docs_with_scores
+        };
+
+        {
+            let _span = tracing::info_span!("candidate_sort").entered();
+            docs_with_scores.sort_unstable_by(|a, b| {
+                b.1.partial_cmp(&a.1)
+                    .unwrap_or(Ordering::Equal)
+                    .then_with(|| a.0.cmp(&b.0))
             });
-            docs_with_scores.truncate(take_n);
         }
 
-        docs_with_scores.sort_unstable_by(|a, b| {
-            b.1.partial_cmp(&a.1)
-                .unwrap_or(Ordering::Equal)
-                .then_with(|| a.0.cmp(&b.0))
-        });
-
         let mut candidates = docs_with_scores;
-        prune_by_alpha(&mut candidates, alpha, k, gap_relative);
+        {
+            let _span =
+                tracing::info_span!("alpha_prune", alpha = alpha, gap_relative = gap_relative,)
+                    .entered();
+            prune_by_alpha(&mut candidates, alpha, k, gap_relative);
+        }
         candidates
     }
 
@@ -663,8 +679,14 @@ impl<const M: usize> Tachiom<M> {
         k: usize,
         beta: Option<usize>,
     ) -> Vec<(f32, u32)> {
-        let query_evaluator = self.residuals.encoder().query_evaluator(query);
+        let query_evaluator = {
+            let _span = tracing::info_span!("rerank_prepare").entered();
+            self.residuals.encoder().query_evaluator(query)
+        };
+        let score_span = tracing::info_span!("rerank_score", candidates = candidates.len());
+        let select_span = tracing::info_span!("rerank_select", beta = beta);
         let score_doc = |doc_id: u32| -> f32 {
+            let _guard = score_span.enter();
             let doc_view = self.residuals.get(doc_id as u64);
             query_evaluator.compute_distance(doc_view).0
         };
@@ -680,49 +702,64 @@ impl<const M: usize> Tachiom<M> {
 
             for (doc_id, _) in candidates.iter().take(k) {
                 let score = score_doc(*doc_id);
-                heap.push(MinHeapScore {
-                    score,
-                    doc_id: *doc_id,
-                });
+                {
+                    let _guard = select_span.enter();
+                    heap.push(MinHeapScore {
+                        score,
+                        doc_id: *doc_id,
+                    });
+                }
             }
 
             let mut n_stalls = 0usize;
             for (doc_id, _) in candidates.iter().skip(k) {
                 let score = score_doc(*doc_id);
-                if let Some(worst) = heap.peek() {
-                    if score > worst.score {
-                        heap.push(MinHeapScore {
-                            score,
-                            doc_id: *doc_id,
-                        });
-                        if heap.len() > k {
-                            heap.pop();
-                        }
-                        n_stalls = 0;
-                    } else {
-                        n_stalls += 1;
-                        if n_stalls >= beta_val {
-                            break;
+                {
+                    let _guard = select_span.enter();
+                    if let Some(worst) = heap.peek() {
+                        if score > worst.score {
+                            heap.push(MinHeapScore {
+                                score,
+                                doc_id: *doc_id,
+                            });
+                            if heap.len() > k {
+                                heap.pop();
+                            }
+                            n_stalls = 0;
+                        } else {
+                            n_stalls += 1;
+                            if n_stalls >= beta_val {
+                                break;
+                            }
                         }
                     }
                 }
             }
 
-            result_scores.reserve(heap.len());
-            while let Some(item) = heap.pop() {
-                result_scores.push((item.score, item.doc_id));
+            {
+                let _guard = select_span.enter();
+                result_scores.reserve(heap.len());
+                while let Some(item) = heap.pop() {
+                    result_scores.push((item.score, item.doc_id));
+                }
+                result_scores.reverse();
             }
-            result_scores.reverse();
             return result_scores;
         }
 
         // Fallback: score all candidates (no beta, or beta set but candidates < k).
         for (doc_id, _) in candidates.iter() {
             let score = score_doc(*doc_id);
-            result_scores.push((score, *doc_id));
+            {
+                let _guard = select_span.enter();
+                result_scores.push((score, *doc_id));
+            }
         }
-        result_scores.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal));
-        result_scores.truncate(k);
+        {
+            let _span = tracing::info_span!("rerank_sort").entered();
+            result_scores.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal));
+            result_scores.truncate(k);
+        }
         result_scores
     }
 
@@ -752,6 +789,20 @@ impl<const M: usize> Tachiom<M> {
         impute_missing: bool,
         gap_relative: bool,
     ) -> Vec<(f32, u32)> {
+        let _search_span = tracing::info_span!(
+            "search",
+            k = k,
+            k_centroids = k_centroids,
+            k_docs_to_score = k_docs_to_score,
+            ef_search = ef_search,
+            alpha = alpha,
+            beta = beta,
+            lambda = lambda,
+            impute_missing = impute_missing,
+            gap_relative = gap_relative,
+        )
+        .entered();
+
         let search_params = Self::build_search_params(ef_search, lambda);
 
         let mut doc_scores: FxHashMap<u32, f32> = FxHashMap::default();
@@ -764,7 +815,9 @@ impl<const M: usize> Tachiom<M> {
             &mut doc_scores,
         );
 
-        let candidates = Self::select_candidates(doc_scores, k, k_docs_to_score, alpha, gap_relative);
+        let candidates =
+            Self::select_candidates(doc_scores, k, k_docs_to_score, alpha, gap_relative);
+
         self.rerank_candidates(query, &candidates, k, beta)
     }
 
@@ -845,55 +898,6 @@ impl<const M: usize> Tachiom<M> {
                 .expect("failed to build rayon thread pool")
                 .install(parallel),
         }
-    }
-
-    /// Same as [`Self::search`] but returns per-stage timings. For benchmarking only.
-    #[allow(clippy::too_many_arguments)]
-    pub fn search_with_timings<'a>(
-        &'a self,
-        query: vectorium::DenseMultiVectorView<'a, f32>,
-        k: usize,
-        k_centroids: usize,
-        k_docs_to_score: usize,
-        ef_search: usize,
-        alpha: Option<f32>,
-        beta: Option<usize>,
-        lambda: Option<f32>,
-        impute_missing: bool,
-        gap_relative: bool,
-    ) -> (Vec<(f32, u32)>, SearchTimings) {
-        use std::time::Instant;
-
-        let search_params = Self::build_search_params(ef_search, lambda);
-
-        let t0 = Instant::now();
-        let mut doc_scores: FxHashMap<u32, f32> = FxHashMap::default();
-        doc_scores.reserve(4096);
-        self.accumulate_coarse_scores(
-            query,
-            k_centroids,
-            &search_params,
-            impute_missing,
-            &mut doc_scores,
-        );
-        let stage1_ns = t0.elapsed().as_nanos();
-
-        let t1 = Instant::now();
-        let candidates = Self::select_candidates(doc_scores, k, k_docs_to_score, alpha, gap_relative);
-        let stage2_ns = t1.elapsed().as_nanos();
-
-        let t2 = Instant::now();
-        let results = self.rerank_candidates(query, &candidates, k, beta);
-        let stage3_ns = t2.elapsed().as_nanos();
-
-        (
-            results,
-            SearchTimings {
-                stage1_ns,
-                stage2_ns,
-                stage3_ns,
-            },
-        )
     }
 }
 

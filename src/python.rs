@@ -5,6 +5,7 @@
 
 use crate::hnsw::HNSWBuildConfiguration;
 use crate::pgc::{EmptyAnchorStrategy, PgcBuilder};
+use crate::profile::{self, ProfileSpan};
 use crate::tac::{TacAllocParams, TacBuilder, TacResult};
 use crate::tachiom::{Tachiom, TachiomBuildParams, TachiomInputDataset};
 use vectorium::core::index::Index;
@@ -19,7 +20,7 @@ use numpy::{
 };
 use pyo3::exceptions::{PyIOError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyType};
+use pyo3::types::{PyDict, PyList, PyType};
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -411,7 +412,12 @@ fn cluster_tac(
         .as_slice()
         .map_err(|_| PyValueError::new_err("token_ids must be C-contiguous"))?;
     let resolved = resolve_tac_params(
-        ids_u32, total_centroids, tac_micro_threshold, tac_small_threshold, None, None,
+        ids_u32,
+        total_centroids,
+        tac_micro_threshold,
+        tac_small_threshold,
+        None,
+        None,
     );
     let tac = TacBuilder::new()
         .n_iter(tac_n_iter)
@@ -426,13 +432,15 @@ fn cluster_tac(
         .build();
     let dim = dataset.encoder().input_dim();
     let budget = resolved.total_centroids;
-    let result =
-        py.allow_threads(|| tac.train(dataset.values(), dim, &token_ids_vec, budget));
+    let result = py.allow_threads(|| tac.train(dataset.values(), dim, &token_ids_vec, budget));
 
     let centroids_f32: Vec<f32> = result.centroids.iter().map(|x| x.to_f32()).collect();
     let cen = ndarray::Array2::from_shape_vec((result.n_centroids, dim), centroids_f32)
         .map_err(|e| PyRuntimeError::new_err(format!("centroids reshape: {e}")))?;
-    Ok((cen.into_pyarray(py).unbind(), result.assignments.into_pyarray(py).unbind()))
+    Ok((
+        cen.into_pyarray(py).unbind(),
+        result.assignments.into_pyarray(py).unbind(),
+    ))
 }
 
 /// Run PGC clustering only; return (centroids, assignments).
@@ -502,7 +510,10 @@ fn cluster_pgc(
     let cen = ndarray::Array2::from_shape_vec((result.n_centroids, result.dim), centroids_f32)
         .map_err(|e| PyRuntimeError::new_err(format!("centroids reshape: {e}")))?;
     let asgn: Vec<u32> = result.assignments.iter().map(|&x| x as u32).collect();
-    Ok((cen.into_pyarray(py).unbind(), asgn.into_pyarray(py).unbind()))
+    Ok((
+        cen.into_pyarray(py).unbind(),
+        asgn.into_pyarray(py).unbind(),
+    ))
 }
 
 // ============================================================================
@@ -682,7 +693,8 @@ impl PyTachiom {
             center_dataset,
         };
 
-        let inner = py.allow_threads(|| dispatch_pq!(pq_subspaces, build_index_m(dataset, &params)));
+        let inner =
+            py.allow_threads(|| dispatch_pq!(pq_subspaces, build_index_m(dataset, &params)));
         Ok(PyTachiom { inner })
     }
 
@@ -781,7 +793,8 @@ impl PyTachiom {
             center_dataset,
         };
 
-        let inner = py.allow_threads(|| dispatch_pq!(pq_subspaces, build_index_m(dataset, &params)));
+        let inner =
+            py.allow_threads(|| dispatch_pq!(pq_subspaces, build_index_m(dataset, &params)));
         Ok(PyTachiom { inner })
     }
 
@@ -908,7 +921,11 @@ impl PyTachiom {
             // Borrow dataset.values() for PGC; the borrow ends when cluster() returns,
             // so dataset can then be moved into build_index_from_tac without a clone.
             let pgc_result = pgc.cluster(dataset.values(), dim, n_req);
-            let (c, nc, a) = (pgc_result.centroids, pgc_result.n_centroids, pgc_result.assignments);
+            let (c, nc, a) = (
+                pgc_result.centroids,
+                pgc_result.n_centroids,
+                pgc_result.assignments,
+            );
             dispatch_pq!(pq_subspaces, build_from_tac_m(c, nc, a, dataset, &params))
         });
         Ok(PyTachiom { inner })
@@ -969,7 +986,9 @@ impl PyTachiom {
 
         let cshape = centroids.shape();
         if cshape.len() != 2 {
-            return Err(PyValueError::new_err("centroids must be a 2D array [K, dim]"));
+            return Err(PyValueError::new_err(
+                "centroids must be a 2D array [K, dim]",
+            ));
         }
         let n_centroids = cshape[0];
         let centroids_f16: Vec<f16> = centroids
@@ -1007,7 +1026,16 @@ impl PyTachiom {
         };
 
         let inner = py.allow_threads(|| {
-            dispatch_pq!(pq_subspaces, build_from_tac_m(centroids_f16, n_centroids, assignments_usize, dataset, &params))
+            dispatch_pq!(
+                pq_subspaces,
+                build_from_tac_m(
+                    centroids_f16,
+                    n_centroids,
+                    assignments_usize,
+                    dataset,
+                    &params
+                )
+            )
         });
         Ok(PyTachiom { inner })
     }
@@ -1079,7 +1107,10 @@ impl PyTachiom {
         };
 
         let inner = py.allow_threads(|| {
-            dispatch_pq!(pq_subspaces, build_from_tac_m(centroids_f16, n_centroids, assignments, dataset, &params))
+            dispatch_pq!(
+                pq_subspaces,
+                build_from_tac_m(centroids_f16, n_centroids, assignments, dataset, &params)
+            )
         });
         Ok(PyTachiom { inner })
     }
@@ -1090,7 +1121,12 @@ impl PyTachiom {
     /// format is M-specific); the caller is responsible for tracking it.
     #[classmethod]
     #[pyo3(signature = (path, *, pq_subspaces = 32))]
-    fn load(_cls: &Bound<'_, PyType>, py: Python<'_>, path: &str, pq_subspaces: usize) -> PyResult<Self> {
+    fn load(
+        _cls: &Bound<'_, PyType>,
+        py: Python<'_>,
+        path: &str,
+        pq_subspaces: usize,
+    ) -> PyResult<Self> {
         warn_pq_subspaces(py, pq_subspaces)?;
         let path_owned = path.to_owned();
         let inner = py
@@ -1325,6 +1361,24 @@ impl PyTachiom {
             scores_arr.into_pyarray(py).unbind(),
             doc_ids_arr.into_pyarray(py).unbind(),
         ))
+    }
+
+    /// Enable tracing collection for subsequent normal search calls.
+    ///
+    /// This is the PyLate bridge hook: it toggles collection out-of-band, then
+    /// callers invoke the regular `search` / `batch_search` APIs and drain the
+    /// resulting span trees with `take_profile`.
+    fn begin_profile(&self) {
+        profile::begin();
+    }
+
+    /// Drain PyLate-compatible span trees captured since `begin_profile`.
+    fn take_profile<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        let roots = PyList::empty(py);
+        for root in profile::take() {
+            roots.append(profile_span_to_dict(py, &root)?)?;
+        }
+        Ok(roots)
     }
 
     // ── Inspection ───────────────────────────────────────────────────────────
@@ -1637,6 +1691,25 @@ where
     }
     arr.as_slice()
         .map_err(|_| PyValueError::new_err(format!("{arg_name} could not be exposed as a slice")))
+}
+
+fn profile_span_to_dict<'py>(py: Python<'py>, span: &ProfileSpan) -> PyResult<Bound<'py, PyDict>> {
+    let dict = PyDict::new(py);
+    dict.set_item("name", &span.name)?;
+    dict.set_item("dur_ns", span.dur_ns)?;
+    dict.set_item("device", &span.device)?;
+    dict.set_item("count", span.count)?;
+    let meta = PyDict::new(py);
+    for (key, value) in &span.meta {
+        meta.set_item(key, value)?;
+    }
+    dict.set_item("meta", meta)?;
+    let children = PyList::empty(py);
+    for child in &span.children {
+        children.append(profile_span_to_dict(py, child)?)?;
+    }
+    dict.set_item("children", children)?;
+    Ok(dict)
 }
 
 /// Pad a single-query result vector to length `k` with sentinels.
