@@ -280,14 +280,37 @@ impl TokenAwareClustering {
         let print_every = (n_groups / 20).max(1); // ~5% intervals
         let kmeans_start = Instant::now();
 
+        // Process the largest token groups FIRST. The head tokens (a handful with
+        // millions of vectors) dominate runtime, so (1) starting them at t≈0 makes
+        // their cost observable immediately instead of hidden in the final few % once
+        // every small group has finished, and (2) longest-processing-time-first is the
+        // makespan-minimizing schedule, so the biggest token can't land late and stretch
+        // the wall-clock. HashMap iteration order is otherwise arbitrary.
+        let mut ordered: Vec<(usize, &Vec<usize>)> =
+            token_groups.iter().map(|(&tid, idx)| (tid, idx)).collect();
+        ordered.sort_by_key(|(_, idx)| std::cmp::Reverse(idx.len()));
+        // Log each head token's start + duration so the long tail isn't a stuck counter.
+        let head_threshold = 500_000usize;
+
         let results: Vec<(
             usize,
             PlainDenseDataset<f16, SquaredEuclideanDistance>,
             Vec<u32>,
-        )> = token_groups
+        )> = ordered
             .par_iter()
-            .map(|(&token_id, indices)| {
+            .map(|&(token_id, indices)| {
                 let k = allocation[&token_id];
+                let is_head = self.verbose && indices.len() >= head_threshold;
+                let t_tok = Instant::now();
+                if is_head {
+                    eprintln!(
+                        "  [head] token {} START: n={}, k={} ({:.1}s in)",
+                        token_id,
+                        indices.len(),
+                        k,
+                        kmeans_start.elapsed().as_secs_f64(),
+                    );
+                }
                 let (centroids, local_assignments) = train_kmeans_for_token(
                     data,
                     indices,
@@ -297,6 +320,15 @@ impl TokenAwareClustering {
                     self.max_sample_size,
                     self.alloc_params.min_pts_per_centroid,
                 );
+                if is_head {
+                    eprintln!(
+                        "  [head] token {} DONE in {:.1}s (n={}, k={})",
+                        token_id,
+                        t_tok.elapsed().as_secs_f64(),
+                        indices.len(),
+                        k,
+                    );
+                }
                 let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
                 if self.verbose && (done % print_every == 0 || done == n_groups) {
                     eprintln!(

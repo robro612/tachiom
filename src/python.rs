@@ -19,7 +19,7 @@ use numpy::{
 };
 use pyo3::exceptions::{PyIOError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyType};
+use pyo3::types::{PyDict, PyList, PyType};
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -1335,6 +1335,53 @@ impl PyTachiom {
             scores_arr.into_pyarray(py).unbind(),
             doc_ids_arr.into_pyarray(py).unbind(),
         ))
+    }
+
+    /// Whether this build was compiled with the `profile` feature.
+    ///
+    /// `begin_profile` / `take_profile` are always exported, so `hasattr` cannot
+    /// distinguish a profiling build from a default one; callers should probe
+    /// this and fail loudly rather than silently collect nothing.
+    ///
+    /// A static method so a build can be probed without loading an index —
+    /// `Tachiom.profile_supported()` — while still answering on an instance,
+    /// which is how PyLate's `require_rust_profile` calls it.
+    #[staticmethod]
+    fn profile_supported() -> bool {
+        crate::stage_shim::supported()
+    }
+
+    /// Begin collecting flat search-stage timings (no-op unless built with `profile`).
+    ///
+    /// Call before a normal `search` / `batch_search`, then drain with [`take_profile`].
+    /// The buffer is process-global, so Rayon-worker stages are drained too, but a
+    /// multi-query batch yields repeated samples per stage rather than per-query
+    /// latency. See `stage-profile` crate docs.
+    fn begin_profile(&self) {
+        crate::stage_shim::begin();
+    }
+
+    /// Drain stage samples collected since [`begin_profile`] as Span-compatible dicts.
+    ///
+    /// Drains the process-global buffer, so samples recorded on Rayon workers
+    /// are included; repeats of a stage arrive in completion order.
+    fn take_profile<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        let out = PyList::empty(py);
+        for sample in crate::stage_shim::take() {
+            let d = PyDict::new(py);
+            d.set_item("name", sample.name)?;
+            d.set_item("dur_ns", sample.dur_ns)?;
+            d.set_item("device", "cpu")?;
+            d.set_item("count", 1usize)?;
+            let meta = PyDict::new(py);
+            for (key, value) in sample.meta {
+                meta.set_item(key, value)?;
+            }
+            d.set_item("meta", meta)?;
+            d.set_item("children", PyList::empty(py))?;
+            out.append(d)?;
+        }
+        Ok(out)
     }
 
     // ── Inspection ───────────────────────────────────────────────────────────

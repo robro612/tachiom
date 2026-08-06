@@ -756,16 +756,29 @@ impl<const M: usize> Tachiom<M> {
 
         let mut doc_scores: FxHashMap<u32, f32> = FxHashMap::default();
         doc_scores.reserve(4096);
-        self.accumulate_coarse_scores(
-            query,
-            k_centroids,
-            &search_params,
-            impute_missing,
-            &mut doc_scores,
-        );
+        {
+            let _stage = stage!("coarse_accumulate");
+            self.accumulate_coarse_scores(
+                query,
+                k_centroids,
+                &search_params,
+                impute_missing,
+                &mut doc_scores,
+            );
+        }
 
-        let candidates = Self::select_candidates(doc_scores, k, k_docs_to_score, alpha, gap_relative);
-        self.rerank_candidates(query, &candidates, k, beta)
+        let candidates = {
+            let mut _stage = stage!("candidate_select");
+            let c = Self::select_candidates(doc_scores, k, k_docs_to_score, alpha, gap_relative);
+            _stage.set("n_candidates", c.len() as f64);
+            c
+        };
+
+        {
+            let mut _stage = stage!("rerank");
+            _stage.set("n_candidates", candidates.len() as f64);
+            self.rerank_candidates(query, &candidates, k, beta)
+        }
     }
 
     /// Search a batch of queries, optionally in parallel.

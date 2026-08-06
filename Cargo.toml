@@ -10,6 +10,9 @@ crate-type = ["cdylib", "rlib"]
 default = []
 python  = ["dep:pyo3", "dep:numpy"]
 cli     = ["dep:clap", "dep:anyhow"]
+# Optional flat stage timers for PyLate experiment profiling.
+# Build with: maturin develop --features python,profile
+profile = ["dep:stage-profile"]
 
 [dependencies]
 half        = { version = "2.4", features = ["serde", "std", "num-traits"] }
@@ -25,6 +28,7 @@ pyo3        = { version = "0.24", features = ["extension-module"], optional = tr
 numpy       = { version = "0.24", optional = true, features = ["half"] }
 vectorium   = { git = "https://github.com/TusKANNy/vectorium.git", tag = "v0.3.0", features = ["multivec"] }
 kannolo     = { git = "https://github.com/TusKANNy/kannolo.git", tag = "v0.6.1" }
+stage-profile = { path = "../pylate-pgc/crates/stage-profile", optional = true }
 
 [[bin]]
 name = "tachiom_build"
