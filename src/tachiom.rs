@@ -663,7 +663,14 @@ impl<const M: usize> Tachiom<M> {
         k: usize,
         beta: Option<usize>,
     ) -> Vec<(f32, u32)> {
-        let query_evaluator = self.residuals.encoder().query_evaluator(query);
+        // Stages here are disjoint, and deliberately not per-candidate: a guard
+        // inside the scoring loop would cost an Instant::now() per document and
+        // distort the very number it measures. `n_scored` carries the per-query
+        // work instead, which is what explains a latency tail.
+        let query_evaluator = {
+            let _stage = stage!("rerank/encoder");
+            self.residuals.encoder().query_evaluator(query)
+        };
         let score_doc = |doc_id: u32| -> f32 {
             let doc_view = self.residuals.get(doc_id as u64);
             query_evaluator.compute_distance(doc_view).0
@@ -677,37 +684,69 @@ impl<const M: usize> Tachiom<M> {
         {
             // Beta-based early termination: min-heap of size k.
             let mut heap: BinaryHeap<MinHeapScore> = BinaryHeap::with_capacity(k);
+            let mut n_scored = 0usize;
+            let mut early_terminated = false;
 
-            for (doc_id, _) in candidates.iter().take(k) {
-                let score = score_doc(*doc_id);
-                heap.push(MinHeapScore {
-                    score,
-                    doc_id: *doc_id,
-                });
+            // Seeding scores a fixed k with no comparisons; streaming is the
+            // variable part beta can cut short. Splitting them separates a cost
+            // that cannot change from the one worth tuning — and the p90 tail
+            // lives in the second. Both remain whole-loop guards, one timer
+            // each, so counters rather than extra `Instant::now()` calls carry
+            // the per-candidate story: divide a stage by its `n_scored`.
+            {
+                let mut _stage = stage!("rerank/seed");
+                for (doc_id, _) in candidates.iter().take(k) {
+                    let score = score_doc(*doc_id);
+                    n_scored += 1;
+                    heap.push(MinHeapScore {
+                        score,
+                        doc_id: *doc_id,
+                    });
+                }
+                _stage.set("k", k as f64);
+                _stage.set("n_scored", n_scored as f64);
             }
 
-            let mut n_stalls = 0usize;
-            for (doc_id, _) in candidates.iter().skip(k) {
-                let score = score_doc(*doc_id);
-                if let Some(worst) = heap.peek() {
-                    if score > worst.score {
-                        heap.push(MinHeapScore {
-                            score,
-                            doc_id: *doc_id,
-                        });
-                        if heap.len() > k {
-                            heap.pop();
-                        }
-                        n_stalls = 0;
-                    } else {
-                        n_stalls += 1;
-                        if n_stalls >= beta_val {
-                            break;
+            {
+                let mut _stage = stage!("rerank/stream");
+                let n_seeded = n_scored;
+                // Heap admissions: the work beyond a bare distance computation,
+                // and why a stream can cost more than `n_scored` alone implies.
+                let mut n_admitted = 0usize;
+                let mut n_stalls = 0usize;
+                for (doc_id, _) in candidates.iter().skip(k) {
+                    let score = score_doc(*doc_id);
+                    n_scored += 1;
+                    if let Some(worst) = heap.peek() {
+                        if score > worst.score {
+                            heap.push(MinHeapScore {
+                                score,
+                                doc_id: *doc_id,
+                            });
+                            if heap.len() > k {
+                                heap.pop();
+                            }
+                            n_admitted += 1;
+                            n_stalls = 0;
+                        } else {
+                            n_stalls += 1;
+                            if n_stalls >= beta_val {
+                                early_terminated = true;
+                                break;
+                            }
                         }
                     }
                 }
+                _stage.set("n_candidates", candidates.len() as f64);
+                _stage.set("n_scored", (n_scored - n_seeded) as f64);
+                _stage.set("n_admitted", n_admitted as f64);
+                // How much of the candidate list beta let us skip entirely.
+                _stage.set("n_skipped", candidates.len().saturating_sub(n_scored) as f64);
+                _stage.set("early_terminated", if early_terminated { 1.0 } else { 0.0 });
             }
 
+            let mut _stage = stage!("rerank/select");
+            _stage.set("k", k as f64);
             result_scores.reserve(heap.len());
             while let Some(item) = heap.pop() {
                 result_scores.push((item.score, item.doc_id));
@@ -717,12 +756,25 @@ impl<const M: usize> Tachiom<M> {
         }
 
         // Fallback: score all candidates (no beta, or beta set but candidates < k).
-        for (doc_id, _) in candidates.iter() {
-            let score = score_doc(*doc_id);
-            result_scores.push((score, *doc_id));
+        // Distinct stage name from the beta path — same work, different regime,
+        // and coalescing the two by name would average them into nonsense.
+        {
+            let mut _stage = stage!("rerank/score_full");
+            for (doc_id, _) in candidates.iter() {
+                let score = score_doc(*doc_id);
+                result_scores.push((score, *doc_id));
+            }
+            _stage.set("n_candidates", candidates.len() as f64);
+            _stage.set("n_scored", candidates.len() as f64);
+            _stage.set("early_terminated", 0.0);
         }
-        result_scores.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal));
-        result_scores.truncate(k);
+        {
+            let mut _stage = stage!("rerank/select");
+            _stage.set("k", k as f64);
+            result_scores
+                .sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal));
+            result_scores.truncate(k);
+        }
         result_scores
     }
 
@@ -757,7 +809,7 @@ impl<const M: usize> Tachiom<M> {
         let mut doc_scores: FxHashMap<u32, f32> = FxHashMap::default();
         doc_scores.reserve(4096);
         {
-            let _stage = stage!("coarse_accumulate");
+            let mut _stage = stage!("coarse_accumulate");
             self.accumulate_coarse_scores(
                 query,
                 k_centroids,
@@ -765,20 +817,28 @@ impl<const M: usize> Tachiom<M> {
                 impute_missing,
                 &mut doc_scores,
             );
+            // Head of the candidate funnel: every doc that any query token's
+            // centroid lists touched, before `candidate_select` prunes it. Read
+            // against candidate_select's n_candidates for coarse selectivity.
+            _stage.set("n_query_tokens", query.iter_vectors().count() as f64);
+            _stage.set("k_centroids", k_centroids as f64);
+            _stage.set("n_docs_touched", doc_scores.len() as f64);
         }
 
         let candidates = {
             let mut _stage = stage!("candidate_select");
+            let n_in = doc_scores.len();
             let c = Self::select_candidates(doc_scores, k, k_docs_to_score, alpha, gap_relative);
+            _stage.set("n_docs_in", n_in as f64);
             _stage.set("n_candidates", c.len() as f64);
             c
         };
 
-        {
-            let mut _stage = stage!("rerank");
-            _stage.set("n_candidates", candidates.len() as f64);
-            self.rerank_candidates(query, &candidates, k, beta)
-        }
+        // No outer "rerank" guard: rerank_candidates emits its own disjoint
+        // rerank/* stages. The phase is reconstructed downstream from the
+        // `parent/leaf` names, not from a parent guard, which a flat collector
+        // could not express without double-counting its own children.
+        self.rerank_candidates(query, &candidates, k, beta)
     }
 
     /// Search a batch of queries, optionally in parallel.

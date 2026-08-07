@@ -1179,7 +1179,12 @@ impl PyTachiom {
             ))
         });
 
-        let (scores, doc_ids) = pad_result(result, k);
+        let (scores, doc_ids) = {
+            let mut _stage = stage!("result/materialize");
+            _stage.set("n_queries", 1.0);
+            _stage.set("k", k as f64);
+            pad_result(result, k)
+        };
         Ok((
             scores.into_pyarray(py).unbind(),
             doc_ids.into_pyarray(py).unbind(),
@@ -1330,7 +1335,16 @@ impl PyTachiom {
             ))
         });
 
-        let (scores_arr, doc_ids_arr) = pad_results_batch(results, n_queries, k);
+        // Padding the ragged per-query results into rectangular (n_queries, k)
+        // arrays and handing them to numpy. Runs after `allow_threads` releases,
+        // so it is real serial cost on the return path; without a guard it lands
+        // in the wrapper's derived `overhead/dispatch` and looks like Python.
+        let (scores_arr, doc_ids_arr) = {
+            let mut _stage = stage!("result/materialize");
+            _stage.set("n_queries", n_queries as f64);
+            _stage.set("k", k as f64);
+            pad_results_batch(results, n_queries, k)
+        };
         Ok((
             scores_arr.into_pyarray(py).unbind(),
             doc_ids_arr.into_pyarray(py).unbind(),
