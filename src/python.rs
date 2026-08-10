@@ -1430,6 +1430,21 @@ impl PyTachiom {
         with_inner!(self, t => t.centroids.n_elements())
     }
 
+    /// Postings per centroid: the length of each centroid's inverted list
+    /// (deduplicated document ids), as a 1D array of length `n_centroids`.
+    /// This is the structural driver of coarse coverage — probing `k_centroids`
+    /// lists touches the sum of these lengths, so a finer clustering (more,
+    /// shorter lists) sees fewer documents at the same `k_centroids`.
+    #[getter]
+    fn inverted_list_lengths<'py>(&self, py: Python<'py>) -> Py<PyArray1<u32>> {
+        let lengths: Vec<u32> = with_inner!(self, t => t
+            .offsets
+            .windows(2)
+            .map(|w| (w[1] - w[0]) as u32)
+            .collect());
+        lengths.into_pyarray(py).unbind()
+    }
+
     /// Print a per-component size breakdown of the index.
     fn print_space_usage(&self) {
         let (ch, il, off, res) = with_inner!(self, t => t.space_usage_components());
