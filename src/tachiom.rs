@@ -561,6 +561,12 @@ impl<const M: usize> Tachiom<M> {
     /// shift-invariant, so keeping the constant puts scores on the true
     /// imputed-CQMS scale and lets alpha-pruning operate correctly. No-op when
     /// `impute_missing` is false (`m_i = 0`).
+    ///
+    /// Returns the number of inverted-list entries read. That is the work this
+    /// stage actually does; `doc_scores.len()` reports only the distinct documents
+    /// that survive deduplication, and cannot explain the tail that comes from
+    /// probing a very long list (a measured 208,896-document centroid on LoTTE is
+    /// 8.6% of the corpus in one cell).
     fn accumulate_coarse_scores(
         &self,
         query: vectorium::DenseMultiVectorView<'_, f32>,
@@ -568,9 +574,10 @@ impl<const M: usize> Tachiom<M> {
         search_params: &HNSWSearchConfiguration,
         impute_missing: bool,
         doc_scores: &mut FxHashMap<u32, f32>,
-    ) {
+    ) -> usize {
         let mut best_per_doc: FxHashMap<u32, f32> = FxHashMap::default();
         best_per_doc.reserve(128);
+        let mut n_postings = 0usize;
 
         // Σ_i m_i: the per-query imputation constant, added back after the loop.
         let mut m_sum = 0.0f32;
@@ -598,6 +605,7 @@ impl<const M: usize> Tachiom<M> {
             {
                 let off_start = self.offsets[cidx];
                 let off_end = self.offsets[cidx + 1];
+                n_postings += off_end - off_start;
                 for &doc_id in &self.inverted_lists[off_start..off_end] {
                     best_per_doc
                         .entry(doc_id)
@@ -618,6 +626,8 @@ impl<const M: usize> Tachiom<M> {
                 *score += m_sum;
             }
         }
+
+        n_postings
     }
 
     /// Stage 2: turn the coarse-score map into a sorted, alpha-pruned candidate list.
@@ -671,9 +681,39 @@ impl<const M: usize> Tachiom<M> {
             let _stage = stage!("rerank/encoder");
             self.residuals.encoder().query_evaluator(query)
         };
-        let score_doc = |doc_id: u32| -> f32 {
+        // Returns the score *and* the document's token count. Rerank cost is linear
+        // in tokens, not documents, but `n_scored` counts documents — so the same
+        // candidate budget costs more when a wider probe selects longer documents.
+        // Measured on LoTTE at k_docs_to_score=2000: rerank/score_full is 131.5,
+        // 146.0, 158.1 and 159.5 ms for k_centroids 40, 80, 160 and 320, over an
+        // identical 2000 documents. `num_vecs()` is a struct field read, not a
+        // computation, so carrying the count out costs nothing.
+        let score_doc = |doc_id: u32| -> (f32, usize) {
             let doc_view = self.residuals.get(doc_id as u64);
-            query_evaluator.compute_distance(doc_view).0
+            let n_tokens = doc_view.num_vecs();
+            (query_evaluator.compute_distance(doc_view).0, n_tokens)
+        };
+
+        // The PQ evaluator times its own two phases on every `compute_distance`
+        // call, with five `Instant::now()` pairs that run in profile *and* plain
+        // builds. Nothing read them, so rerank was one opaque number owning
+        // 85-97% of query latency. Reading them here is four `Cell::get`s per
+        // stage and adds nothing to the hot path.
+        //
+        //   centroid_* — phase 1: the random 512-byte coarse-centroid gather
+        //                (1.8 GB table, no cache holds it) plus the per-document
+        //                146x128 by 128xQ GEMM.
+        //   residual   — phase 2: the M=32 walk over the 384 KB PQ table.
+        //
+        // Values are microseconds, cumulative over the evaluator's life (one per
+        // query), so the seed/stream split below is taken as a difference.
+        let phase_us = || -> [f64; 4] {
+            [
+                query_evaluator.centroid_alloc_us.get(),
+                query_evaluator.centroid_extract_us.get(),
+                query_evaluator.centroid_gemm_us.get(),
+                query_evaluator.residual_time_us.get(),
+            ]
         };
 
         let mut result_scores: Vec<(f32, u32)> = Vec::new();
@@ -693,11 +733,13 @@ impl<const M: usize> Tachiom<M> {
             // lives in the second. Both remain whole-loop guards, one timer
             // each, so counters rather than extra `Instant::now()` calls carry
             // the per-candidate story: divide a stage by its `n_scored`.
+            let mut n_doc_tokens = 0usize;
             {
                 let mut _stage = stage!("rerank/seed");
                 for (doc_id, _) in candidates.iter().take(k) {
-                    let score = score_doc(*doc_id);
+                    let (score, n_tokens) = score_doc(*doc_id);
                     n_scored += 1;
+                    n_doc_tokens += n_tokens;
                     heap.push(MinHeapScore {
                         score,
                         doc_id: *doc_id,
@@ -705,7 +747,14 @@ impl<const M: usize> Tachiom<M> {
                 }
                 _stage.set("k", k as f64);
                 _stage.set("n_scored", n_scored as f64);
+                _stage.set("n_doc_tokens", n_doc_tokens as f64);
+                let t = phase_us();
+                _stage.set("us_centroid_alloc", t[0]);
+                _stage.set("us_centroid_extract", t[1]);
+                _stage.set("us_centroid_gemm", t[2]);
+                _stage.set("us_residual", t[3]);
             }
+            let t_after_seed = phase_us();
 
             {
                 let mut _stage = stage!("rerank/stream");
@@ -714,9 +763,11 @@ impl<const M: usize> Tachiom<M> {
                 // and why a stream can cost more than `n_scored` alone implies.
                 let mut n_admitted = 0usize;
                 let mut n_stalls = 0usize;
+                let n_tokens_seeded = n_doc_tokens;
                 for (doc_id, _) in candidates.iter().skip(k) {
-                    let score = score_doc(*doc_id);
+                    let (score, n_tokens) = score_doc(*doc_id);
                     n_scored += 1;
+                    n_doc_tokens += n_tokens;
                     if let Some(worst) = heap.peek() {
                         if score > worst.score {
                             heap.push(MinHeapScore {
@@ -739,10 +790,18 @@ impl<const M: usize> Tachiom<M> {
                 }
                 _stage.set("n_candidates", candidates.len() as f64);
                 _stage.set("n_scored", (n_scored - n_seeded) as f64);
+                _stage.set("n_doc_tokens", (n_doc_tokens - n_tokens_seeded) as f64);
                 _stage.set("n_admitted", n_admitted as f64);
                 // How much of the candidate list beta let us skip entirely.
                 _stage.set("n_skipped", candidates.len().saturating_sub(n_scored) as f64);
                 _stage.set("early_terminated", if early_terminated { 1.0 } else { 0.0 });
+                // Phase timers are cumulative over the evaluator, so subtract the
+                // seed's share to leave the streaming loop's own.
+                let t = phase_us();
+                _stage.set("us_centroid_alloc", t[0] - t_after_seed[0]);
+                _stage.set("us_centroid_extract", t[1] - t_after_seed[1]);
+                _stage.set("us_centroid_gemm", t[2] - t_after_seed[2]);
+                _stage.set("us_residual", t[3] - t_after_seed[3]);
             }
 
             let mut _stage = stage!("rerank/select");
@@ -760,13 +819,21 @@ impl<const M: usize> Tachiom<M> {
         // and coalescing the two by name would average them into nonsense.
         {
             let mut _stage = stage!("rerank/score_full");
+            let mut n_doc_tokens = 0usize;
             for (doc_id, _) in candidates.iter() {
-                let score = score_doc(*doc_id);
+                let (score, n_tokens) = score_doc(*doc_id);
+                n_doc_tokens += n_tokens;
                 result_scores.push((score, *doc_id));
             }
             _stage.set("n_candidates", candidates.len() as f64);
             _stage.set("n_scored", candidates.len() as f64);
+            _stage.set("n_doc_tokens", n_doc_tokens as f64);
             _stage.set("early_terminated", 0.0);
+            let t = phase_us();
+            _stage.set("us_centroid_alloc", t[0]);
+            _stage.set("us_centroid_extract", t[1]);
+            _stage.set("us_centroid_gemm", t[2]);
+            _stage.set("us_residual", t[3]);
         }
         {
             let mut _stage = stage!("rerank/select");
@@ -810,7 +877,7 @@ impl<const M: usize> Tachiom<M> {
         doc_scores.reserve(4096);
         {
             let mut _stage = stage!("coarse_accumulate");
-            self.accumulate_coarse_scores(
+            let n_postings = self.accumulate_coarse_scores(
                 query,
                 k_centroids,
                 &search_params,
@@ -823,6 +890,10 @@ impl<const M: usize> Tachiom<M> {
             _stage.set("n_query_tokens", query.iter_vectors().count() as f64);
             _stage.set("k_centroids", k_centroids as f64);
             _stage.set("n_docs_touched", doc_scores.len() as f64);
+            // Entries read vs distinct docs kept: the duplication factor of
+            // probing wide, and the only counter that can explain this stage's
+            // tail (p50 12.2 ms, p90 46.7 ms on TAC at k_centroids=20).
+            _stage.set("n_postings", n_postings as f64);
         }
 
         let candidates = {

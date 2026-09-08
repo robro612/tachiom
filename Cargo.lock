@@ -1943,7 +1943,6 @@ checksum = "f1bddf1187be692e79c5ffeab891132dfb0f236ed36a43c7ed39f1165ee20191"
 [[package]]
 name = "vectorium"
 version = "0.3.0"
-source = "git+https://github.com/TusKANNy/vectorium.git?tag=v0.3.0#74af320f0caef12f5dcae68d540dcf92b18179c0"
 dependencies = [
  "bincode 2.0.1",
  "bytemuck",

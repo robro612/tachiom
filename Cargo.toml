@@ -55,6 +55,16 @@ name = "bench_tac"
 path = "src/bin/bench_tac.rs"
 required-features = ["cli"]
 
+# Local vectorium checkout, for changes to the scoring kernels in
+# `multivec_two_level_pq.rs`. A [patch] rather than an edit to the dependency
+# line above: it redirects every path to that crate, kannolo's included, so the
+# build resolves one vectorium instead of two. The checkout has to stay on a
+# commit declaring version 0.3.0 or cargo rejects the patch.
+#
+# Comment out to build against the upstream tag again.
+[patch."https://github.com/TusKANNy/vectorium.git"]
+vectorium = { path = "../vectorium" }
+
 [profile.release]
 opt-level = 3
 debug = false

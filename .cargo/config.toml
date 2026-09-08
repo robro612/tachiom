@@ -1,2 +1,24 @@
 [net]
 git-fetch-with-cli = true
+
+# Build the scoring kernels with AVX2 + FMA.
+#
+# Without this, cargo targets the default x86-64, whose baseline is SSE2: four
+# floats per instruction and no fused multiply-add. `objdump` on the 2026-08-07
+# profiling build of this crate found 0 AVX-512 instructions, 3184 SSE `addps`
+# and only 168 AVX `vaddps`. faer checks the CPU at run time and reaches AVX2,
+# which is where the ymm and vfmadd counts come from; vectorium's PQ kernel
+# (`two_level_pq_maxsim_blocked*`) and this crate's coarse accumulator carry no
+# `#[target_feature]` and no run-time check, so they got the baseline. Their
+# inner loop adds 12 floats: 3 SSE instructions, or 2 with AVX2.
+#
+# `x86-64-v3` rather than `native` because the cluster is mixed. The login node
+# is an EPYC 7713 (Zen 3, no AVX-512); the cpu-partition nodes that ran the
+# LoTTE profiles are Xeon Silver 4114 (Skylake-SP, has AVX-512). A `native`
+# build on either would risk SIGILL on the other. Every node here is v3-capable.
+#
+# This applies to dependencies too, which is the point — the hot kernel is in
+# vectorium, not here. Verify a build with:
+#   objdump -d <ext>.so | grep -cE '\s(addps|addss|mulps|mulss)\s'   # want ~0
+[build]
+rustflags = ["-C", "target-cpu=x86-64-v3"]
